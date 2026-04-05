@@ -1,0 +1,29 @@
+# Copy to user_config.yaml next to default_config.yaml to override settings.
+# Keys merge recursively with config/default_config.yaml.
+
+paths:
+  cache_dir: data/cache
+  log_dir: data/logs
+  build_root: data/builds
+  packages_dir: data/packages
+
+kernel:
+  localversion: "-getkernel"
+  reuse_downloads: true
+
+build:
+  jobs: null
+  target: bindeb-pkg
+  use_llvm: false
+  localmodconfig: false
+  # config_fragments:
+  #   - config/fragments/example-debug.cfg
+
+logging:
+  level: INFO
+  json_format: true
+
+dependencies:
+  auto_install: true
+  apt_update: true
+  install_optional: false

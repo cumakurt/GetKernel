@@ -1,0 +1,45 @@
+# GetKernel default configuration (English keys; UI may localize)
+# Override with config/user_config.yaml (see config/user_config.yaml.example).
+# CLI: --output-dir, --config, --dry-run, --quiet, --yes, --fragment, --llvm, --localmodconfig
+
+paths:
+  cache_dir: data/cache
+  log_dir: data/logs
+  build_root: data/builds
+  packages_dir: data/packages
+  # When running as root, optional system paths:
+  # source_parent: /usr/src
+
+kernel:
+  localversion: "-getkernel"
+  include_beta: true
+  include_rc: true
+  verify_checksum: true
+  # If true, skip HTTP download when linux-{version}/ or the tarball already exists under build_root.
+  reuse_downloads: true
+
+build:
+  jobs: null  # null = cpu count
+  # bindeb-pkg: binary .deb only (works with tarball trees). deb-pkg needs a git clone.
+  target: bindeb-pkg
+  use_ccache: true
+  # LLVM=1 (clang) for kernel build; requires clang/llvm on PATH
+  use_llvm: false
+  # After base .config: trim to currently loaded modules (needs running system + lsmod)
+  localmodconfig: false
+  # Paths (relative to project root or absolute) merged via scripts/kconfig/merge_config.sh -m
+  config_fragments: []
+
+system:
+  min_disk_gb: 20
+  min_ram_gb: 4
+
+logging:
+  level: INFO
+  json_format: true
+
+# Before download/build: install missing REQUIRED_PACKAGES (and optionally OPTIONAL) via apt.
+dependencies:
+  auto_install: true
+  apt_update: true
+  install_optional: false
