@@ -24,6 +24,10 @@ class TestNeedsElevation(unittest.TestCase):
         self.assertTrue(needs_elevation(["uninstall"]))
         self.assertTrue(needs_elevation(["rollback", "backup-123"]))
 
+    def test_subcommand_help_skips_elevation(self) -> None:
+        self.assertFalse(needs_elevation(["build", "--help"]))
+        self.assertFalse(needs_elevation(["install", "-h"]))
+
     def test_deps_without_install_skips(self) -> None:
         self.assertFalse(needs_elevation(["deps"]))
 

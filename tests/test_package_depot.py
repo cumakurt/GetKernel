@@ -41,16 +41,23 @@ class TestPackageDepot(unittest.TestCase):
             deb = latest / "linux-image-test_1_amd64.deb"
             deb.write_bytes(b"deb")
             (latest / BUILD_INFO_FILENAME).write_text("{}", encoding="utf-8")
-            archived = archive_latest_to_build_id(root, "abc123")
+            build_id = "a1b2c3d4e5f6"
+            archived = archive_latest_to_build_id(root, build_id)
             self.assertIsNotNone(archived)
             assert archived is not None
             self.assertTrue((archived / deb.name).is_file())
-            write_build_history_entry(root, "abc123", {"requested_version": "6.1.0"})
+            write_build_history_entry(root, build_id, {"requested_version": "6.1.0"})
             archives = list_archived_builds(root)
             self.assertEqual(len(archives), 1)
-            self.assertEqual(archives[0]["build_id"], "abc123")
-            resolved = resolve_package_paths(root, build_id="abc123")
+            self.assertEqual(archives[0]["build_id"], build_id)
+            resolved = resolve_package_paths(root, build_id=build_id)
             self.assertEqual(len(resolved), 1)
+
+    def test_resolve_rejects_invalid_build_id(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self.assertEqual(resolve_package_paths(root, build_id="../outside"), [])
+            self.assertEqual(resolve_package_paths(root, build_id="not-hex"), [])
 
 
 if __name__ == "__main__":

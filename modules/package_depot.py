@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from modules.package_builder import BUILD_INFO_FILENAME
+from utils.validator import path_is_within, validate_build_id
 
 ARCHIVE_DIRNAME = "archive"
 
@@ -73,8 +74,11 @@ def resolve_package_paths(
     build_id: Optional[str] = None,
 ) -> List[Path]:
     if build_id:
-        target = packages_dir / ARCHIVE_DIRNAME / f"build-{build_id}"
-        if not target.is_dir():
+        if not validate_build_id(build_id):
+            return []
+        archive_root = (packages_dir / ARCHIVE_DIRNAME).resolve()
+        target = (archive_root / f"build-{build_id}").resolve()
+        if not target.is_dir() or not path_is_within(target, archive_root):
             return []
         return sorted(target.glob("linux-*.deb"))
     latest = packages_dir / "latest"
@@ -84,6 +88,8 @@ def resolve_package_paths(
 
 
 def archive_latest_to_build_id(packages_dir: Path, build_id: str) -> Optional[Path]:
+    if not validate_build_id(build_id):
+        return None
     latest = packages_dir / "latest"
     if not latest.is_dir():
         return None

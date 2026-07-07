@@ -123,7 +123,7 @@ done
 if [[ $(id -u) -ne 0 ]]; then
   if command -v sudo >/dev/null 2>&1; then
     ui_warn "Administrator privileges required — switching to sudo …"
-    exec sudo -E "$ROOT/install.sh" "$@"
+    exec sudo "$ROOT/install.sh" "$@"
   fi
   ui_err "Run as root: sudo \"$ROOT/install.sh\""
   exit 1
@@ -162,9 +162,7 @@ _array_append_unique() {
 _is_getkernel_symlink() {
   local p="$1"
   [[ -L "$p" ]] || return 1
-  local target
-  target=$(readlink "$p" 2>/dev/null || true)
-  [[ "$target" == *getkernel* ]] || [[ "$target" == *GetKernel* ]] || [[ "$target" == *".venv/bin/getkernel"* ]]
+  _install_dir_from_symlink "$p" >/dev/null
 }
 
 _path_equal() {

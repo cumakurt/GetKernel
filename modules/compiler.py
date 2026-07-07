@@ -16,6 +16,8 @@ from utils.constants import COMPILATION_ERROR_HINTS
 from utils.exceptions import CompilationError
 from utils.helpers import project_root, run_cmd
 
+BUILD_TIMEOUT_SEC = 86400
+
 PHASE_LABELS = {
     "starting": "Starting build",
     "preparing": "Preparing kernel tree",
@@ -190,6 +192,22 @@ class Compiler:
                 return True
         return False
 
+    def _append_build_line(
+        self,
+        line: str,
+        log_file,
+        verbose: bool,
+        progress_callback: Optional[Callable[[BuildProgressSnapshot], None]],
+    ) -> None:
+        self._log_lines.append(line)
+        log_file.write(line)
+        if verbose:
+            print(line, end="")
+        if self._progress_helper:
+            self._progress_helper.update(line)
+            if progress_callback:
+                progress_callback(self._progress_helper.snapshot())
+
     def compile_kernel(
         self,
         target: str = "bindeb-pkg",
@@ -244,19 +262,43 @@ class Compiler:
         )
         self._log_lines = []
         line_count = 0
+        deadline = (self.compilation_start_time or time.time()) + BUILD_TIMEOUT_SEC
         if proc.stdout:
             with open(log_file, "w", encoding="utf-8") as lf:
-                for line in proc.stdout:
-                    self._log_lines.append(line)
-                    lf.write(line)
+                while True:
+                    if time.time() >= deadline:
+                        proc.kill()
+                        proc.wait(timeout=30)
+                        raise CompilationError(
+                            f"Build timed out after {BUILD_TIMEOUT_SEC // 3600} hours"
+                        )
+                    if proc.poll() is not None:
+                        for line in proc.stdout:
+                            self._append_build_line(
+                                line,
+                                lf,
+                                verbose,
+                                progress_callback,
+                            )
+                            line_count += 1
+                        break
+                    import select
+
+                    ready, _, _ = select.select([proc.stdout], [], [], 1.0)
+                    if not ready:
+                        continue
+                    line = proc.stdout.readline()
+                    if not line:
+                        if proc.poll() is not None:
+                            break
+                        continue
+                    self._append_build_line(line, lf, verbose, progress_callback)
                     line_count += 1
-                    if verbose:
-                        print(line, end="")
-                    if self._progress_helper:
-                        self._progress_helper.update(line)
-                        if progress_callback:
-                            progress_callback(self._progress_helper.snapshot())
-        rc = proc.wait()
+        try:
+            rc = proc.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            rc = proc.wait(timeout=30)
         elapsed = time.time() - (self.compilation_start_time or time.time())
         self.estimated_duration = elapsed
 

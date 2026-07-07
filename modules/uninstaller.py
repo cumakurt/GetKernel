@@ -23,8 +23,7 @@ def _is_getkernel_symlink(path: Path) -> bool:
         target = os.readlink(path)
     except OSError:
         return False
-    needles = ("getkernel", "GetKernel", ".venv/bin/getkernel")
-    return any(n in target for n in needles)
+    return target.endswith("/.venv/bin/getkernel") or target.endswith(".venv/bin/getkernel")
 
 
 def detect_remnants() -> Tuple[List[Path], List[Path]]:
@@ -82,7 +81,7 @@ def _strip_path_snippet(rc_file: Path) -> None:
         rc_file.write_text(new_text, encoding="utf-8")
 
 
-def uninstall_getkernel(*, assume_yes: bool = False) -> List[str]:
+def uninstall_getkernel() -> List[str]:
     """Remove install tree, symlinks, and PATH snippets. Returns removed paths."""
     if not is_root() and not sudo_prefix():
         raise PermissionError("Root or sudo required to uninstall GetKernel.")

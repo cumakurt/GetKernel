@@ -20,7 +20,7 @@ from utils.constants import (
 )
 from utils.exceptions import DownloadError, VerificationError
 from utils.helpers import cdn_source_url, kernel_major_branch, project_root, run_cmd
-from utils.validator import safe_extract_path
+from utils.validator import safe_extract_path, safe_extract_tarball
 
 
 class KernelFetcher:
@@ -559,12 +559,10 @@ class KernelFetcher:
             for name in names:
                 safe_extract_path(target, name)
             root_dir = names[0].split("/")[0]
-            # Use 'data' filter for security (Python 3.12+); fall back gracefully
             try:
                 tf.extractall(path=target, filter="data")
             except TypeError:
-                # Python < 3.12 does not support the filter parameter
-                tf.extractall(path=target)
+                safe_extract_tarball(tf, target)
         out = target / root_dir
         if not out.is_dir():
             raise DownloadError("Unexpected tarball layout")

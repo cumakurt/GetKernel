@@ -145,23 +145,20 @@ def needs_elevation(argv: list[str]) -> bool:
     Return True when the invoked command should run as root (sudo).
     Help/version and read-only commands stay unprivileged.
     """
-    # Only treat global help/version as unprivileged (first token), not e.g. `build --version 6.1`.
-    if argv and argv[0] in ("-h", "--help", "--version"):
+    if any(arg in ("-h", "--help") for arg in argv):
+        return False
+    if argv and argv[0] in ("--version",):
         return False
     if not argv:
         return True
     first = argv[0]
-    if first in ("check", "list", "about", "status"):
-        return False
-    if first == "packages":
-        return False
-    if first == "backups":
+    if first in ("check", "list", "about", "status", "packages", "backups"):
         return False
     if first in ("install", "rollback", "uninstall", "cleanup"):
         return True
     if first == "deps":
         return "--install" in argv
-    if first in ("interactive", "build", "prepare", "cleanup"):
+    if first in ("interactive", "build", "prepare"):
         return True
     return False
 

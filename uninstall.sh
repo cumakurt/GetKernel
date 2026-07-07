@@ -41,7 +41,7 @@ done
 if [[ $(id -u) -ne 0 ]]; then
   if command -v sudo >/dev/null 2>&1; then
     echo "${_YL}!${_R} Administrator privileges required — switching to sudo …"
-    exec sudo -E "$ROOT/uninstall.sh" "$@"
+    exec sudo "$ROOT/uninstall.sh" "$@"
   fi
   echo "${_RD}Run as root: sudo \"$ROOT/uninstall.sh\"${_R}" >&2
   exit 1

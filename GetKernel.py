@@ -67,7 +67,7 @@ from utils.ui import (
     print_table,
     prompt_kernel_selection,
 )
-from utils.validator import validate_kernel_version
+from utils.validator import validate_backup_id, validate_build_id, validate_kernel_version
 
 _VERSION_MESSAGE = (
     "%(prog)s %(version)s\n"
@@ -404,6 +404,8 @@ def cmd_deps(install: bool) -> None:
 @click.option("--dry-run", is_flag=True, help="Show what would be removed without deleting")
 def cmd_cleanup(old_kernels: bool, build_artifacts: bool, keep: int, dry_run: bool) -> None:
     """Remove old kernels and/or build artifacts."""
+    if keep < 0:
+        raise click.BadParameter("--keep must be >= 0")
     if not old_kernels and not build_artifacts:
         click.echo("Specify --old-kernels and/or --build-artifacts. See: getkernel cleanup --help")
         return
@@ -411,7 +413,10 @@ def cmd_cleanup(old_kernels: bool, build_artifacts: bool, keep: int, dry_run: bo
     paths = _paths(cfg)
     if old_kernels:
         inst = Installer()
-        removed = inst.remove_old_kernels(keep_count=keep, dry_run=dry_run)
+        try:
+            removed = inst.remove_old_kernels(keep_count=keep, dry_run=dry_run)
+        except ValueError as exc:
+            raise click.BadParameter(str(exc)) from exc
         if removed:
             for r in removed:
                 click.echo(f"  {r}")
@@ -473,6 +478,9 @@ def cmd_status(as_json: bool) -> None:
 @click.option("--kernel-version", default=None, help="Expected kernel release for post-install verification")
 def cmd_install(ctx: click.Context, build_id: Optional[str], kernel_version: Optional[str]) -> None:
     """Install .deb packages from the package depot (latest or archived build)."""
+    if build_id is not None and not validate_build_id(build_id):
+        click.echo("Invalid --build-id (expected 12 lowercase hex characters).", err=True)
+        sys.exit(1)
     cfg = _load_config()
     paths = _paths(cfg)
     log = setup_logging(paths["logs"], **cfg.get("logging", {}))
@@ -559,6 +567,12 @@ def cmd_backups(as_json: bool) -> None:
 @click.argument("backup_id")
 def cmd_rollback(backup_id: str) -> None:
     """Restore /boot files from a backup created by GetKernel."""
+    if not validate_backup_id(backup_id):
+        click.echo(
+            "Invalid backup id (expected format: backup-YYYYMMDD-HHMMSS).",
+            err=True,
+        )
+        sys.exit(1)
     inst = Installer()
     if not inst.rollback(backup_id):
         click.echo(f"Rollback failed for backup {backup_id!r}.", err=True)
@@ -575,6 +589,16 @@ def cmd_uninstall(assume_yes: bool) -> None:
         click.echo("No GetKernel installation remnants detected.")
         return
     click.echo("Will remove:")
+    from utils.constants import GETKERNEL_INSTALL_DIR
+
+    if any(p.resolve() == GETKERNEL_INSTALL_DIR.resolve() for p in paths):
+        click.echo(
+            click.style(
+                "  Warning: this deletes all runtime data under data/cache, "
+                "data/builds, data/logs, and data/packages.",
+                fg="yellow",
+            )
+        )
     for p in paths:
         click.echo(f"  {p}")
     for f in rc_files:
@@ -583,7 +607,7 @@ def cmd_uninstall(assume_yes: bool) -> None:
         click.echo("Cancelled.")
         return
     try:
-        removed = uninstall_getkernel(assume_yes=True)
+        removed = uninstall_getkernel()
     except PermissionError as exc:
         click.echo(str(exc), err=True)
         sys.exit(1)
@@ -820,7 +844,8 @@ def run_build_flow(
         sys.exit(1)
     ok, errs = pb.verify_packages(debs)
     if not ok:
-        click.echo("Package verification issues: " + "; ".join(errs), err=True)
+        click.echo("Package verification failed: " + "; ".join(errs), err=True)
+        sys.exit(1)
     moved = pb.move_packages(
         debs,
         requested_version=version,

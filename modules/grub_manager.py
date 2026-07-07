@@ -67,6 +67,8 @@ class GrubManager:
         if menu_index is not None:
             val = f'"{menu_index}"'
         elif kernel_version:
+            if not re.match(r"^[0-9][0-9a-zA-Z.+~_-]+$", kernel_version):
+                return False
             val = f'"1>{kernel_version}"'
         else:
             return False

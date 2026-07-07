@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from datetime import datetime
@@ -12,6 +13,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from utils.exceptions import InstallationError
 from utils.helpers import is_root, run_cmd, sudo_prefix
+from utils.validator import (
+    check_file_safety,
+    path_is_within,
+    validate_backup_id,
+    validate_boot_backup_filename,
+)
 
 from modules.grub_manager import GrubManager
 
@@ -59,6 +66,11 @@ class Installer:
             return False, "no packages"
         if not is_root() and not sudo_prefix():
             raise InstallationError("Root or sudo required for dpkg.")
+
+        for deb in package_list:
+            ok, msg = check_file_safety(deb)
+            if not ok:
+                raise InstallationError(f"Unsafe package file {deb}: {msg}")
 
         pre = sudo_prefix()
         files = [str(p) for p in package_list]
@@ -114,18 +126,39 @@ class Installer:
         return bid
 
     def rollback(self, backup_id: str) -> bool:
-        src = self.backup_dir / backup_id
-        if not src.is_dir():
+        if not validate_backup_id(backup_id):
+            return False
+        src = (self.backup_dir / backup_id).resolve()
+        if not src.is_dir() or not path_is_within(src, self.backup_dir.resolve()):
             return False
         man = src / "manifest.json"
         if not man.is_file():
             return False
         meta = json.loads(man.read_text(encoding="utf-8"))
+        boot = Path("/boot").resolve()
         pre = sudo_prefix()
         for f in meta.get("files", []):
-            shutil.copy2(src / f, Path("/boot") / f)
+            if not isinstance(f, str) or not validate_boot_backup_filename(f):
+                return False
+            src_file = (src / f).resolve()
+            if not path_is_within(src_file, src):
+                return False
+            if not src_file.is_file():
+                return False
+            dest = boot / f
+            shutil.copy2(src_file, dest)
         subprocess.run(pre + ["update-grub"], capture_output=True)
         return True
+
+    @staticmethod
+    def _kernel_sort_key(release: str) -> tuple:
+        match = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?", release)
+        if match:
+            parts = [int(x) for x in match.groups() if x is not None]
+            while len(parts) < 3:
+                parts.append(0)
+            return tuple(parts)
+        return (0, 0, 0)
 
     def list_backups(self) -> List[Dict[str, str]]:
         out: List[Dict[str, str]] = []
@@ -191,18 +224,22 @@ class Installer:
         if cp.returncode != 0:
             return []
         packages: List[str] = []
+        suffix = f"-{kernel_version}"
         for line in cp.stdout.splitlines():
             name = line.strip()
             if not name.startswith("linux-"):
                 continue
-            if kernel_version in name or name.endswith(kernel_version):
+            if name.endswith(kernel_version) or suffix in name:
                 packages.append(name)
         return sorted(set(packages))
 
     def remove_old_kernels(self, keep_count: int = 2, dry_run: bool = False) -> List[str]:
         """Remove old kernel packages, keeping the running kernel and the newest *keep_count*."""
+        if keep_count < 0:
+            raise ValueError("keep_count must be >= 0")
         current = os.uname().release
         installed = self.list_installed_kernels()
+        installed.sort(key=lambda k: self._kernel_sort_key(k["version"]))
         candidates = [k for k in installed if k["version"] != current]
         if len(candidates) <= keep_count:
             return []
