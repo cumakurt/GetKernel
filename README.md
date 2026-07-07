@@ -18,10 +18,33 @@ Build custom Linux kernel `.deb` packages on Debian-based systems: fetch from ke
 git clone https://github.com/cumakurt/GetKernel.git
 cd GetKernel
 sudo ./install.sh
-sudo getkernel                    # interactive wizard (default)
-# or a direct build:
+
+# Recommended: interactive wizard (default when no command is given)
+sudo getkernel
+
+# Advanced: direct build without the wizard
 sudo getkernel build --version 6.12.8
 ```
+
+> **Note:** `sudo ./install.sh` installs the GetKernel **tool**. `sudo getkernel` (alone) starts the **kernel build wizard** — not tool installation.
+
+## Recommended: interactive mode
+
+After installing GetKernel, the easiest way to build a kernel is to run **no subcommand at all**:
+
+```bash
+sudo getkernel
+```
+
+This is equivalent to `sudo getkernel interactive` and is the **recommended entry point** for most users. The wizard walks you through:
+
+1. System snapshot (running kernel, hardware, loaded modules)
+2. Build dependency check (optional apt install)
+3. Kernel version selection from kernel.org
+4. Whether to install `.deb` packages after the build
+5. Build confirmation and live progress
+
+Use direct commands such as `getkernel build --version 6.12.8` only when you already know the version and flags you need (scripts, CI, or advanced workflows).
 
 ## Requirements
 
@@ -67,7 +90,7 @@ pip install -e ".[dev]"
 
 | Command | Purpose |
 |---------|---------|
-| `getkernel` / `interactive` | Step-by-step wizard (default) |
+| `getkernel` / `interactive` | Step-by-step wizard (**default**, recommended) |
 | `build` | Download, configure, compile, package; optional install |
 | `prepare` | Source + config only (no compile) |
 | `list` | Kernel versions from kernel.org (`--json`, `--no-rc`) |
@@ -86,31 +109,130 @@ Global flags: `--help`, `--version`, `--yes` / `-y` (auto-confirm install prompt
 
 Run `getkernel <command> --help` for full options.
 
-## Common workflows
+## Examples
 
-| Goal | Command |
-|------|---------|
-| Guided build | `sudo getkernel` |
-| Full build + install prompt | `sudo getkernel build --version 6.12.8` |
-| Build `.deb` only | `sudo getkernel build --version 6.12.8 --skip-install` |
-| Prepare tree, no compile | `sudo getkernel prepare --version 6.12.8` |
-| Non-interactive install | `sudo getkernel --yes build --version 6.12.8` |
-| Custom `.config` | `sudo getkernel build --version 6.12.8 --config /path/.config` |
-| Kconfig fragments | `sudo getkernel build --version 6.12.8 --fragment cfg1 --fragment cfg2` |
-| Build profile | `--profile minimal`, `server`, or `desktop` |
-| Interactive Kconfig | `--menuconfig` |
-| Resume failed build | `--resume-build` |
-| Trim to loaded modules | `--localmodconfig` |
-| Clang/LLVM build | `--llvm` (install clang/llvm first) |
-| Existing source tree | `--source-dir /path/to/linux-X.Y.Z` |
-| Custom package output | `--output-dir /path/to/debs` |
-| Force full rebuild | `--force-rebuild` |
-| Install from depot | `sudo getkernel install` or `install --build-id <id>` |
-| System status (JSON) | `getkernel status --json` |
-| Roll back boot files | `sudo getkernel rollback backup-YYYYMMDD-HHMMSS` |
-| Uninstall GetKernel | `sudo ./uninstall.sh` or `sudo getkernel uninstall` |
-| Clean old kernels | `sudo getkernel cleanup --old-kernels` |
-| Clean build junk | `sudo getkernel cleanup --build-artifacts` |
+### Tool install / uninstall
+
+```bash
+sudo ./install.sh
+sudo ./install.sh --dev
+sudo ./install.sh --yes
+sudo ./install.sh --recreate-venv
+sudo ./install.sh --no-symlink
+sudo ./uninstall.sh
+sudo getkernel uninstall -y
+```
+
+### General CLI
+
+```bash
+getkernel --help
+getkernel --version
+getkernel about
+sudo getkernel --yes build --version 6.12.8
+GETKERNEL_ASSUME_YES=1 sudo getkernel build --version 6.12.8
+```
+
+### Interactive wizard (recommended)
+
+```bash
+sudo getkernel
+sudo getkernel interactive
+```
+
+### `check` — system validation
+
+```bash
+getkernel check
+getkernel check --json
+```
+
+### `list` — kernel.org versions
+
+```bash
+getkernel list
+getkernel list --no-rc
+getkernel list --json
+```
+
+### `status` — system and depot overview
+
+```bash
+getkernel status
+getkernel status --json
+```
+
+### `deps` — build dependencies
+
+```bash
+getkernel deps
+sudo getkernel deps --install
+```
+
+### `build` — compile kernel packages
+
+```bash
+sudo getkernel build --version 6.12.8
+sudo getkernel build --version 6.12.8 --skip-install
+sudo getkernel --yes build --version 6.12.8
+sudo getkernel build --version 6.12.8 --source-dir /usr/local/getkernel/data/builds/linux-6.12.8
+sudo getkernel build --version 6.12.8 --config /path/to/.config
+sudo getkernel build --version 6.12.8 --fragment config/fragments/my-tweaks.cfg
+sudo getkernel build --version 6.12.8 --profile server
+sudo getkernel build --version 6.12.8 --menuconfig
+sudo getkernel build --version 6.12.8 --localmodconfig
+sudo getkernel build --version 6.12.8 --llvm
+sudo getkernel build --version 6.12.8 --resume-build
+sudo getkernel build --version 6.12.8 --force-rebuild
+sudo getkernel build --version 6.12.8 --output-dir /tmp/my-debs
+sudo getkernel build --version 6.12.8 --dry-run
+sudo getkernel build --version 6.12.8 --verbose
+sudo getkernel build --version 6.12.8 --quiet
+```
+
+### `prepare` — source and config only
+
+```bash
+sudo getkernel prepare --version 6.12.8
+sudo getkernel prepare --version 6.12.8 --config /path/.config
+sudo getkernel prepare --version 6.12.8 --fragment cfg1 --localmodconfig
+```
+
+### `install` — install from package depot
+
+```bash
+sudo getkernel install
+sudo getkernel --yes install
+sudo getkernel install --build-id a1b2c3d4e5f6
+sudo getkernel install --kernel-version 6.12.8-getkernel
+```
+
+### `packages list` — depot contents
+
+```bash
+getkernel packages list
+getkernel packages list --json
+```
+
+### `backups` and `rollback`
+
+```bash
+getkernel backups
+getkernel backups --json
+sudo getkernel rollback backup-20260707-155257
+ls /var/backups/getkernel/backup-20260707-155257/
+cat /var/backups/getkernel/backup-20260707-155257/manifest.json
+```
+
+### `cleanup`
+
+```bash
+sudo getkernel cleanup --old-kernels
+sudo getkernel cleanup --old-kernels --keep 3
+sudo getkernel cleanup --old-kernels --dry-run
+sudo getkernel cleanup --build-artifacts
+sudo getkernel cleanup --old-kernels --build-artifacts
+```
 
 ### Build terminal output
 
@@ -172,6 +294,28 @@ Tarball trees without `.git` use **`bindeb-pkg`** automatically (`deb-pkg` needs
 
 Copy `config/user_config.yaml.example` → `config/user_config.yaml` to override defaults from `config/default_config.yaml`.
 
+Example override:
+
+```yaml
+kernel:
+  localversion: "-custom"
+  reuse_downloads: true
+  verify_checksum: true
+  verify_signature: false
+  include_beta: false
+  include_rc: false
+
+build:
+  jobs: 8
+  target: bindeb-pkg
+  config_fragments:
+    - config/fragments/my.cfg
+
+dependencies:
+  auto_install: true
+  apt_update: true
+```
+
 | Key | Purpose |
 |-----|---------|
 | `paths.*` | cache, logs, builds, packages directories |
@@ -187,6 +331,12 @@ Copy `config/user_config.yaml.example` → `config/user_config.yaml` to override
 | `dependencies.auto_install` | apt install missing build deps before build |
 
 ## Environment variables
+
+```bash
+GETKERNEL_ASSUME_YES=1 sudo getkernel build --version 6.12.8
+GETKERNEL_ROOT=/tmp/gk-test getkernel status
+GETKERNEL_NO_ELEVATE=1 getkernel check    # testing only
+```
 
 | Variable | Effect |
 |----------|--------|
@@ -209,6 +359,7 @@ GetKernel modifies packages, `/boot`, initramfs, and GRUB. Use at your own risk;
 ```bash
 pip install -e ".[dev]"
 pytest
+GETKERNEL_NO_ELEVATE=1 python3 GetKernel.py list --json
 ```
 
 Contributions: [CONTRIBUTING.md](CONTRIBUTING.md)
