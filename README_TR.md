@@ -1,5 +1,15 @@
 # GetKernel
 
+<p align="center">
+  <img src="img/1.png" alt="Etkileşimli sihirbaz — sistem doğrulama ve çekirdek seçimi" width="900" />
+</p>
+<p align="center">
+  <img src="img/2.png" alt="Derleme akışı — kaynak indirme ve canlı derleme ilerlemesi" width="900" />
+</p>
+<p align="center">
+  <img src="img/3.png" alt="Başarılı derleme — üretilen .deb paketleri ve kurulum istemi" width="900" />
+</p>
+
 [![CI](https://github.com/cumakurt/GetKernel/actions/workflows/ci.yml/badge.svg)](https://github.com/cumakurt/GetKernel/actions/workflows/ci.yml)
 [![Lisans: GPL v3](https://img.shields.io/badge/Lisans-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
