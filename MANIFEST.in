@@ -12,7 +12,9 @@ recursive-include config/fragments *.cfg
 
 # System installer (also copied by install.sh)
 include install.sh
+include uninstall.sh
 recursive-include scripts *.sh
+recursive-include config/profiles *.cfg
 
 # Exclude non-package paths from source distributions
 global-exclude *.py[cod] __pycache__ .DS_Store

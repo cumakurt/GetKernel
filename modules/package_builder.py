@@ -145,6 +145,7 @@ class PackageBuilder:
         *,
         requested_version: Optional[str] = None,
         localversion: Optional[str] = None,
+        build_id: Optional[str] = None,
     ) -> List[Path]:
         sub = self.output_dir / "latest"
         sub.mkdir(parents=True, exist_ok=True)
@@ -157,14 +158,33 @@ class PackageBuilder:
             self.create_manifest(out_paths)
             self.calculate_checksums(out_paths)
         if requested_version is not None and localversion is not None and out_paths:
-            self._write_build_info(requested_version, localversion, out_paths)
+            self._write_build_info(requested_version, localversion, out_paths, build_id=build_id)
+        if build_id and out_paths:
+            self._archive_build(build_id, out_paths)
         return out_paths
+
+    def _archive_build(self, build_id: str, packages: List[Path]) -> Path:
+        from modules.package_depot import archive_latest_to_build_id
+
+        archived = archive_latest_to_build_id(self.output_dir, build_id)
+        if archived is None:
+            dest = self.output_dir / "archive" / f"build-{build_id}"
+            dest.mkdir(parents=True, exist_ok=True)
+            for p in packages:
+                shutil.copy2(p, dest / p.name)
+            info = self.output_dir / "latest" / BUILD_INFO_FILENAME
+            if info.is_file():
+                shutil.copy2(info, dest / BUILD_INFO_FILENAME)
+            return dest
+        return archived
 
     def _write_build_info(
         self,
         requested_version: str,
         localversion: str,
         packages: List[Path],
+        *,
+        build_id: Optional[str] = None,
     ) -> None:
         data = {
             "requested_version": requested_version,
@@ -172,8 +192,22 @@ class PackageBuilder:
             "deb_names": [p.name for p in packages],
             "built_at": datetime.now(timezone.utc).isoformat(),
         }
+        if build_id:
+            data["build_id"] = build_id
         dest = self.output_dir / "latest" / BUILD_INFO_FILENAME
         dest.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        if build_id:
+            from modules.package_depot import write_build_history_entry
+
+            write_build_history_entry(
+                self.output_dir,
+                build_id,
+                {
+                    "requested_version": requested_version,
+                    "localversion": localversion,
+                    "deb_count": len(packages),
+                },
+            )
 
     def create_manifest(self, packages: List[Path]) -> Path:
         manifest = self.output_dir / "latest" / "packages.manifest"

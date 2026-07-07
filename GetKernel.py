@@ -8,6 +8,7 @@ Project: https://github.com/cumakurt/GetKernel
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -22,7 +23,20 @@ from modules.dependency_manager import DependencyManager
 from modules.installer import Installer
 from modules.kernel_fetcher import KernelFetcher
 from modules.package_builder import PackageBuilder, find_matching_stored_packages
+from modules.grub_manager import GrubManager
+from modules.package_depot import (
+    list_archived_builds,
+    list_latest_packages,
+    read_build_history,
+    resolve_package_paths,
+)
+from modules.system_advisor import (
+    collect_build_warnings,
+    collect_install_warnings,
+    status_secure_boot,
+)
 from modules.system_checker import SystemChecker
+from modules.uninstaller import detect_remnants, uninstall_getkernel
 from utils.constants import (
     APP_VERSION,
     DEVELOPER_EMAIL,
@@ -60,6 +74,36 @@ _VERSION_MESSAGE = (
     f"{DEVELOPER_NAME} <{DEVELOPER_EMAIL}>\n"
     f"{DEVELOPER_GITHUB_REPO_URL}"
 )
+
+
+def _emit_json(data: Any, *, exit_code: int = 0) -> None:
+    click.echo(json.dumps(data, indent=2, default=str))
+    sys.exit(exit_code)
+
+
+def _make_fetcher(cfg: Dict[str, Any], cache_dir: Path) -> KernelFetcher:
+    return KernelFetcher.from_config(str(cache_dir), cfg.get("kernel") or {})
+
+
+def _resolve_profile_path(cfg: Dict[str, Any], profile: str) -> Path:
+    build_cfg = cfg.get("build") or {}
+    profiles = build_cfg.get("profiles") or {}
+    rel = profiles.get(profile)
+    if not rel:
+        raise click.UsageError(
+            f"Unknown profile {profile!r}. Available: {', '.join(sorted(profiles)) or '(none)'}"
+        )
+    path = resolve_path(project_root(), str(rel))
+    if not path.is_file():
+        raise click.UsageError(f"Profile file not found: {path}")
+    return path
+
+
+def _latest_build_log(logs_dir: Path) -> Optional[Path]:
+    if not logs_dir.is_dir():
+        return None
+    logs = sorted(logs_dir.glob("build-*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return logs[0] if logs else None
 
 
 def _load_config() -> Dict[str, Any]:
@@ -174,12 +218,25 @@ def _install_kernel_packages_phase(
         return
     hint = f"{version}{localver}"
     try:
-        inst.create_backup()
-        ok, ilog = inst.install_packages(moved, kernel_version_hint=hint)
+        ok, ilog, (verified, issues) = inst.install_from_paths(
+            moved,
+            kernel_version_hint=hint,
+            create_backup_first=True,
+        )
         click.echo(ilog[-2000:] if len(ilog) > 2000 else ilog)
         if not ok:
             click.echo("Installation reported errors; check logs.", err=True)
             sys.exit(1)
+        if verified:
+            click.echo(click.style(f"Verified installation for {hint}.", fg="green"))
+        else:
+            click.echo(
+                click.style(
+                    "Installation finished but verification reported issues: "
+                    + "; ".join(issues),
+                    fg="yellow",
+                )
+            )
     except GetKernelError as exc:
         log_exception(log, exc, {})
         raise click.Abort() from exc
@@ -246,13 +303,25 @@ def cli(ctx: click.Context, assume_yes: bool) -> None:
 
 
 @cli.command("check")
-def cmd_check() -> None:
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON")
+def cmd_check(as_json: bool) -> None:
     """Validate OS, disk, RAM, and toolchain."""
     cfg = _load_config()
     paths = _paths(cfg)
     setup_logging(paths["logs"], **cfg.get("logging", {}))
     sc = SystemChecker()
     vr = sc.validate_environment()
+    payload = {
+        "valid": vr.is_valid,
+        "debian_based": sc.is_debian_based(),
+        "root_or_sudo": sc.check_root_privileges(),
+        "kernel": sc.get_current_kernel_version(),
+        "errors": vr.errors,
+        "warnings": vr.warnings,
+        "secure_boot": status_secure_boot(),
+    }
+    if as_json:
+        _emit_json(payload, exit_code=0 if vr.is_valid else 1)
     print_table(
         "System check",
         [
@@ -281,12 +350,13 @@ def cmd_about() -> None:
 
 @cli.command("list")
 @click.option("--no-rc", is_flag=True, help="Hide release candidates")
-def cmd_list(no_rc: bool) -> None:
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON")
+def cmd_list(no_rc: bool, as_json: bool) -> None:
     """List kernel versions from kernel.org."""
     cfg = _load_config()
     paths = _paths(cfg)
     setup_logging(paths["logs"], **cfg.get("logging", {}))
-    fetcher = KernelFetcher(cache_dir=str(paths["cache"]))
+    fetcher = _make_fetcher(cfg, paths["cache"])
     data = fetcher.fetch_kernel_versions(include_rc=not no_rc)
     rows = []
     for v in data.get("versions", [])[:40]:
@@ -297,6 +367,8 @@ def cmd_list(no_rc: bool) -> None:
                 "released": v.get("released", ""),
             }
         )
+    if as_json:
+        _emit_json({"stable": data.get("stable"), "mainline": data.get("mainline"), "versions": rows})
     print_table("Kernel versions (kernel.org)", rows, ["version", "type", "released"])
 
 
@@ -363,6 +435,163 @@ def cmd_cleanup(old_kernels: bool, build_artifacts: bool, keep: int, dry_run: bo
                 click.echo(f"  {src_dir.name}: removed {count} intermediate file(s)")
 
 
+@cli.command("status")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON")
+def cmd_status(as_json: bool) -> None:
+    """Show running kernel, installed kernels, GRUB, depot, and last build log."""
+    cfg = _load_config()
+    paths = _paths(cfg)
+    setup_logging(paths["logs"], **cfg.get("logging", {}))
+    inst = Installer()
+    gm = GrubManager()
+    payload: Dict[str, Any] = {
+        "running_kernel": os.uname().release,
+        "installed_kernels": inst.list_installed_kernels(),
+        "grub_default": gm.get_default_entry(),
+        "grub_entries": gm.get_menu_entries()[:10],
+        "packages_latest": list_latest_packages(paths["packages"]),
+        "packages_archives": list_archived_builds(paths["packages"]),
+        "build_history": read_build_history(paths["packages"], limit=5),
+        "last_build_log": str(_latest_build_log(paths["logs"]) or ""),
+        "secure_boot": status_secure_boot(),
+    }
+    if as_json:
+        _emit_json(payload)
+    click.echo(f"Running kernel: {payload['running_kernel']}")
+    click.echo(f"GRUB default: {payload['grub_default'] or '(unknown)'}")
+    click.echo(f"Secure Boot: {payload['secure_boot']['note']}")
+    print_table("Installed kernels", payload["installed_kernels"][:10], ["version", "is_running"])
+    latest = payload["packages_latest"]
+    click.echo(f"Package depot (latest): {len(latest)} .deb file(s)")
+    if payload["last_build_log"]:
+        click.echo(f"Last build log: {payload['last_build_log']}")
+
+
+@cli.command("install")
+@click.pass_context
+@click.option("--build-id", default=None, help="Install packages from archive/build-<id>/ instead of latest/")
+@click.option("--kernel-version", default=None, help="Expected kernel release for post-install verification")
+def cmd_install(ctx: click.Context, build_id: Optional[str], kernel_version: Optional[str]) -> None:
+    """Install .deb packages from the package depot (latest or archived build)."""
+    cfg = _load_config()
+    paths = _paths(cfg)
+    log = setup_logging(paths["logs"], **cfg.get("logging", {}))
+    packages = resolve_package_paths(paths["packages"], build_id=build_id)
+    if not packages:
+        click.echo("No packages found in the depot.", err=True)
+        sys.exit(1)
+    inst = Installer()
+    assume_yes = bool(ctx.obj.get("assume_yes")) or assume_yes_from_env()
+    for warning in collect_install_warnings(kernel_version or ""):
+        click.echo(click.style(f"Warning: {warning}", fg="yellow"))
+    if not inst.request_installation_approval(packages, assume_yes=assume_yes):
+        click.echo("Installation cancelled.")
+        return
+    hint = kernel_version
+    if not hint:
+        info_path = paths["packages"] / "latest" / "build-info.json"
+        if info_path.is_file():
+            try:
+                meta = json.loads(info_path.read_text(encoding="utf-8"))
+                rv = meta.get("requested_version", "")
+                lv = meta.get("localversion", "")
+                if rv:
+                    hint = f"{rv}{lv}"
+            except (OSError, ValueError, json.JSONDecodeError):
+                hint = None
+    try:
+        ok, ilog, (verified, issues) = inst.install_from_paths(
+            packages,
+            kernel_version_hint=hint,
+            create_backup_first=True,
+        )
+        click.echo(ilog[-2000:] if len(ilog) > 2000 else ilog)
+        if not ok:
+            sys.exit(1)
+        if hint and verified:
+            click.echo(click.style(f"Verified installation for {hint}.", fg="green"))
+        elif hint:
+            click.echo(
+                click.style("Verification issues: " + "; ".join(issues), fg="yellow")
+            )
+    except GetKernelError as exc:
+        log_exception(log, exc, {})
+        raise click.Abort() from exc
+
+
+@cli.group("packages")
+def cmd_packages_group() -> None:
+    """Inspect built kernel packages in the depot."""
+
+
+@cmd_packages_group.command("list")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON")
+def cmd_packages_list(as_json: bool) -> None:
+    """List packages under latest/ and archived builds."""
+    cfg = _load_config()
+    paths = _paths(cfg)
+    payload = {
+        "latest": list_latest_packages(paths["packages"]),
+        "archives": list_archived_builds(paths["packages"]),
+        "history": read_build_history(paths["packages"]),
+    }
+    if as_json:
+        _emit_json(payload)
+    print_table("Latest packages", payload["latest"], ["name", "size_bytes", "built_at"])
+    print_table("Archived builds", payload["archives"], ["build_id", "deb_count", "built_at"])
+
+
+@cli.command("backups")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON")
+def cmd_backups(as_json: bool) -> None:
+    """List boot file backups created before kernel installation."""
+    inst = Installer()
+    rows = inst.list_backups()
+    if as_json:
+        _emit_json({"backups": rows})
+    if not rows:
+        click.echo("No backups found.")
+        return
+    print_table("GetKernel backups", rows, ["id", "kernel_version", "date"])
+
+
+@cli.command("rollback")
+@click.argument("backup_id")
+def cmd_rollback(backup_id: str) -> None:
+    """Restore /boot files from a backup created by GetKernel."""
+    inst = Installer()
+    if not inst.rollback(backup_id):
+        click.echo(f"Rollback failed for backup {backup_id!r}.", err=True)
+        sys.exit(1)
+    click.echo(click.style(f"Restored backup {backup_id}. Run reboot when ready.", fg="green"))
+
+
+@cli.command("uninstall")
+@click.option("--yes", "-y", "assume_yes", is_flag=True, help="Skip confirmation")
+def cmd_uninstall(assume_yes: bool) -> None:
+    """Remove GetKernel from /usr/local/getkernel and related symlinks."""
+    paths, rc_files = detect_remnants()
+    if not paths and not rc_files:
+        click.echo("No GetKernel installation remnants detected.")
+        return
+    click.echo("Will remove:")
+    for p in paths:
+        click.echo(f"  {p}")
+    for f in rc_files:
+        click.echo(f"  PATH snippet in {f}")
+    if not assume_yes and not confirm("Proceed with uninstall?", default=False):
+        click.echo("Cancelled.")
+        return
+    try:
+        removed = uninstall_getkernel(assume_yes=True)
+    except PermissionError as exc:
+        click.echo(str(exc), err=True)
+        sys.exit(1)
+    click.echo(click.style("Removed:", fg="green"))
+    for item in removed:
+        click.echo(f"  {item}")
+
+
 def run_build_flow(
     version: str,
     source_dir: Optional[str],
@@ -378,6 +607,9 @@ def run_build_flow(
     use_llvm: bool = False,
     localmodconfig: bool = False,
     force_rebuild: bool = False,
+    menuconfig: bool = False,
+    resume_build: bool = False,
+    profile: Optional[str] = None,
 ) -> None:
     """Download, configure, compile, package, and optionally install a kernel."""
     cfg = _load_config()
@@ -414,7 +646,14 @@ def run_build_flow(
             print_error_block("Environment check failed", e, vr.recommendations)
         sys.exit(1)
 
-    has_frags = bool(config_fragments) or bool(build_cfg.get("config_fragments"))
+    for warning in collect_build_warnings(version):
+        click.echo(click.style(f"Warning: {warning}", fg="yellow"))
+        if sys.stdin.isatty() and not assume_yes_install and not assume_yes_from_env():
+            if not confirm("Continue despite warnings?", default=True):
+                click.echo("Cancelled.")
+                return
+
+    has_frags = bool(config_fragments) or bool(build_cfg.get("config_fragments")) or bool(profile)
     reuse_allowed = (
         not dry_run
         and not force_rebuild
@@ -423,6 +662,9 @@ def run_build_flow(
         and not has_frags
         and not (bool(build_cfg.get("use_llvm")) or use_llvm)
         and not (bool(build_cfg.get("localmodconfig")) or localmodconfig)
+        and not menuconfig
+        and not resume_build
+        and not profile
     )
     if reuse_allowed:
         existing = find_matching_stored_packages(pkg_out, version, localver)
@@ -439,7 +681,7 @@ def run_build_flow(
             click.echo("Invalid kernel source (no Makefile).", err=True)
             sys.exit(1)
     else:
-        fetcher = KernelFetcher(cache_dir=str(paths["cache"]))
+        fetcher = _make_fetcher(cfg, paths["cache"])
         reuse = bool(kv.get("reuse_downloads", True))
         click.echo(f"Preparing kernel source linux-{version} …")
         try:
@@ -447,6 +689,7 @@ def run_build_flow(
                 version,
                 target_dir=str(paths["builds"]),
                 reuse_existing=reuse,
+                verify_signature=bool(kv.get("verify_signature", False)),
             )
         except GetKernelError as exc:
             log_exception(log, exc, {})
@@ -476,9 +719,14 @@ def run_build_flow(
             base = cm.get_current_config()
             cm.create_new_config(base)
         frag_paths = _collect_config_fragments(cfg, root, config_fragments)
+        if profile:
+            frag_paths.append(_resolve_profile_path(cfg, profile))
         if frag_paths:
             click.echo(f"Merging {len(frag_paths)} config fragment(s) …")
             cm.merge_config_fragments(frag_paths)
+        if menuconfig:
+            click.echo("Launching make menuconfig …")
+            cm.run_menuconfig()
         if use_lmc_build:
             click.echo("Running make localmodconfig …")
             cm.run_localmodconfig()
@@ -491,7 +739,11 @@ def run_build_flow(
         comp.enable_ccache()
     last_build_log: Optional[Path] = None
     try:
-        comp.prepare_source()
+        if resume_build and comp.has_partial_build():
+            click.echo(click.style("Resuming previous partial build …", fg="green"))
+            comp.prepare_source(resume=True)
+        else:
+            comp.prepare_source()
         if dry_run:
             click.echo(
                 click.style(
@@ -573,6 +825,7 @@ def run_build_flow(
         debs,
         requested_version=version,
         localversion=localver,
+        build_id=build_id if not dry_run else None,
     )
     _install_kernel_packages_phase(
         moved,
@@ -653,6 +906,22 @@ def run_build_flow(
     is_flag=True,
     help="Ignore stored .deb packages for this version; always run a full build.",
 )
+@click.option(
+    "--menuconfig",
+    is_flag=True,
+    help="Run interactive make menuconfig after merging config fragments.",
+)
+@click.option(
+    "--resume-build",
+    is_flag=True,
+    help="Skip make clean/prepare when a partial build and .config already exist.",
+)
+@click.option(
+    "--profile",
+    type=click.Choice(["minimal", "server", "desktop"], case_sensitive=False),
+    default=None,
+    help="Apply a named Kconfig profile from config/profiles/.",
+)
 def cmd_build(
     ctx: click.Context,
     version: str,
@@ -667,6 +936,9 @@ def cmd_build(
     use_llvm: bool,
     use_localmodconfig: bool,
     force_rebuild: bool,
+    menuconfig: bool,
+    resume_build: bool,
+    profile: Optional[str],
 ) -> None:
     """Download kernel, configure from running system, compile deb-pkg."""
     if quiet_build and verbose_build:
@@ -687,6 +959,9 @@ def cmd_build(
         use_llvm=use_llvm,
         localmodconfig=use_localmodconfig,
         force_rebuild=force_rebuild,
+        menuconfig=menuconfig,
+        resume_build=resume_build,
+        profile=profile,
     )
 
 
@@ -804,7 +1079,7 @@ def interactive(ctx: click.Context) -> None:
     _ensure_build_dependencies(cfg, logging.getLogger("getkernel"))
 
     print_step(3, total_steps, "Choose kernel version (kernel.org)")
-    fetcher = KernelFetcher(cache_dir=str(paths["cache"]))
+    fetcher = _make_fetcher(cfg, paths["cache"])
     try:
         data = fetcher.fetch_kernel_versions()
     except GetKernelError as exc:

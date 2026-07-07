@@ -151,8 +151,14 @@ def needs_elevation(argv: list[str]) -> bool:
     if not argv:
         return True
     first = argv[0]
-    if first in ("check", "list", "about"):
+    if first in ("check", "list", "about", "status"):
         return False
+    if first == "packages":
+        return False
+    if first == "backups":
+        return False
+    if first in ("install", "rollback", "uninstall", "cleanup"):
+        return True
     if first == "deps":
         return "--install" in argv
     if first in ("interactive", "build", "prepare", "cleanup"):

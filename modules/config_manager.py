@@ -138,6 +138,25 @@ class ConfigManager:
         if cp.returncode != 0:
             raise ConfigError(f"make localmodconfig failed: {(cp.stderr or '')[-4000:]}")
 
+    def run_menuconfig(self) -> None:
+        """Run interactive ``make menuconfig`` (requires a TTY)."""
+        if not self.config_file.is_file():
+            raise ConfigError(".config missing")
+        env = os.environ.copy()
+        env.setdefault("TERM", "xterm")
+        cp = subprocess.run(
+            ["make", "menuconfig"],
+            cwd=self.kernel_source_dir,
+            env=env,
+            timeout=86400,
+        )
+        if cp.returncode != 0:
+            raise ConfigError("make menuconfig failed or was cancelled")
+
+    def apply_build_profile(self, profile_path: Path) -> None:
+        """Merge a named build profile fragment into the current .config."""
+        self.merge_config_fragments([profile_path])
+
     def validate_config(self) -> Tuple[bool, List[str]]:
         errors: List[str] = []
         if not self.config_file.is_file():

@@ -154,12 +154,19 @@ class Compiler:
             overridden = True
         return t, overridden
 
-    def prepare_source(self, config_file: Optional[str] = None) -> bool:
+    def prepare_source(
+        self,
+        config_file: Optional[str] = None,
+        *,
+        resume: bool = False,
+    ) -> bool:
         if config_file:
             src = Path(config_file)
             if src.is_file():
                 dest = self.source_dir / ".config"
                 dest.write_bytes(src.read_bytes())
+        if resume and (self.source_dir / ".config").is_file():
+            return True
         env = os.environ.copy()
         env.setdefault("TERM", "xterm")
         for target in ("olddefconfig", "prepare"):
@@ -174,6 +181,14 @@ class Compiler:
             if cp.returncode != 0:
                 raise CompilationError(f"make {target} failed:\n{cp.stderr[-4000:]}")
         return True
+
+    def has_partial_build(self) -> bool:
+        if not (self.source_dir / ".config").is_file():
+            return False
+        for pattern in ("*.o", "*.ko"):
+            if any(self.source_dir.rglob(pattern)):
+                return True
+        return False
 
     def compile_kernel(
         self,

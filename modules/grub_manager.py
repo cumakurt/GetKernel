@@ -26,7 +26,10 @@ class GrubManager:
     def get_menu_entries(self) -> List[Dict[str, str]]:
         if not self.grub_cfg.is_file():
             return []
-        text = self.grub_cfg.read_text(encoding="utf-8", errors="replace")
+        try:
+            text = self.grub_cfg.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return []
         entries: List[Dict[str, str]] = []
         idx = 0
         for m in re.finditer(r"menuentry\s+'([^']+)'", text):

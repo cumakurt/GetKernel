@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from utils.exceptions import InstallationError
-from utils.helpers import is_root, sudo_prefix
+from utils.helpers import is_root, run_cmd, sudo_prefix
 
 from modules.grub_manager import GrubManager
 
@@ -185,24 +185,38 @@ class Installer:
             )
         return out
 
+    def find_linux_packages(self, kernel_version: str) -> List[str]:
+        """Return installed linux-* package names tied to a kernel release string."""
+        cp = run_cmd(["dpkg-query", "-W", "-f=${Package}\n", "linux-*"])
+        if cp.returncode != 0:
+            return []
+        packages: List[str] = []
+        for line in cp.stdout.splitlines():
+            name = line.strip()
+            if not name.startswith("linux-"):
+                continue
+            if kernel_version in name or name.endswith(kernel_version):
+                packages.append(name)
+        return sorted(set(packages))
+
     def remove_old_kernels(self, keep_count: int = 2, dry_run: bool = False) -> List[str]:
         """Remove old kernel packages, keeping the running kernel and the newest *keep_count*."""
         current = os.uname().release
         installed = self.list_installed_kernels()
-        # Never remove the running kernel
         candidates = [k for k in installed if k["version"] != current]
-        # Keep the newest keep_count kernels (by sort order)
         if len(candidates) <= keep_count:
             return []
         to_remove = candidates[:-keep_count] if keep_count > 0 else candidates
         removed: List[str] = []
         for k in to_remove:
             ver = k["version"]
+            pkgs = self.find_linux_packages(ver)
+            if not pkgs:
+                pkgs = [f"linux-image-{ver}", f"linux-headers-{ver}"]
             if dry_run:
-                removed.append(f"[dry-run] would remove linux-image-{ver}")
+                removed.append(f"[dry-run] would remove: {', '.join(pkgs)}")
                 continue
             pre = sudo_prefix()
-            pkgs = [f"linux-image-{ver}", f"linux-headers-{ver}"]
             cp = subprocess.run(
                 pre + ["dpkg", "--purge", *pkgs],
                 capture_output=True,
@@ -211,4 +225,25 @@ class Installer:
             )
             if cp.returncode == 0:
                 removed.append(ver)
+            else:
+                removed.append(f"failed {ver}: {(cp.stderr or cp.stdout)[-500:]}")
         return removed
+
+    def install_from_paths(
+        self,
+        package_list: List[Path],
+        *,
+        kernel_version_hint: Optional[str] = None,
+        create_backup_first: bool = True,
+    ) -> Tuple[bool, str, Tuple[bool, List[str]]]:
+        """Install packages, optionally back up, and verify when a version hint is given."""
+        if create_backup_first:
+            self.create_backup()
+        ok, log = self.install_packages(
+            package_list,
+            kernel_version_hint=kernel_version_hint,
+        )
+        verified = (False, ["no kernel version hint"])
+        if kernel_version_hint:
+            verified = self.verify_installation(kernel_version_hint)
+        return ok, log, verified

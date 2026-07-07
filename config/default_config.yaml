@@ -15,6 +15,7 @@ kernel:
   include_beta: true
   include_rc: true
   verify_checksum: true
+  verify_signature: false
   # If true, skip HTTP download when linux-{version}/ or the tarball already exists under build_root.
   reuse_downloads: true
 
@@ -29,6 +30,11 @@ build:
   localmodconfig: false
   # Paths (relative to project root or absolute) merged via scripts/kconfig/merge_config.sh -m
   config_fragments: []
+  # Named profiles (merged as Kconfig fragments when --profile is used)
+  profiles:
+    minimal: config/profiles/minimal.cfg
+    server: config/profiles/server.cfg
+    desktop: config/profiles/desktop.cfg
 
 system:
   min_disk_gb: 20

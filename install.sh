@@ -9,8 +9,9 @@ GETKERNEL_BIN="$VENV_DIR/bin/getkernel"
 MARKER_BEGIN="# >>> GetKernel PATH (added by install.sh)"
 MARKER_END="# <<< GetKernel PATH"
 
-REMNANT_PATHS=()
-REMNANT_RC_FILES=()
+EXISTING_SAME_PATH=0
+LEGACY_PATHS=()
+LEGACY_RC_FILES=()
 
 # ── UI (colors disabled when not a TTY or NO_COLOR is set) ──────────────────
 _R='' _B='' _D='' _CY='' _GR='' _YL='' _RD='' _MG=''
@@ -58,7 +59,11 @@ ui_item() {
 
 ui_done() {
   echo ""
-  echo "${_GR}${_B}  Done${_R}"
+  if [[ "$EXISTING_SAME_PATH" -eq 1 ]]; then
+    echo "${_GR}${_B}  Updated${_R}"
+  else
+    echo "${_GR}${_B}  Done${_R}"
+  fi
   echo "${_D}  ─────────────────────────────────────${_R}"
   echo ""
   echo "  ${_B}Run:${_R}  ${_CY}getkernel --help${_R}"
@@ -89,7 +94,7 @@ usage() {
   ui_dim "--dev            dev dependencies (pytest)"
   ui_dim "--recreate-venv  fresh virtualenv"
   ui_dim "--no-symlink     skip /usr/local/bin/getkernel"
-  ui_dim "--yes            remove old files without prompt"
+  ui_dim "--yes            accept update / legacy cleanup without prompt"
   echo ""
   ui_dim "Requires: sudo ./install.sh"
   echo ""
@@ -162,26 +167,89 @@ _is_getkernel_symlink() {
   [[ "$target" == *getkernel* ]] || [[ "$target" == *GetKernel* ]] || [[ "$target" == *".venv/bin/getkernel"* ]]
 }
 
-detect_remnants() {
-  REMNANT_PATHS=()
-  REMNANT_RC_FILES=()
+_path_equal() {
+  local a b
+  a=$(realpath "$1" 2>/dev/null || echo "$1")
+  b=$(realpath "$2" 2>/dev/null || echo "$2")
+  [[ "$a" == "$b" ]]
+}
 
-  [[ -e "$INSTALL_DIR" ]] && _array_append_unique REMNANT_PATHS "$INSTALL_DIR"
-  [[ -e /usr/local/bin/getkernel ]] && _array_append_unique REMNANT_PATHS "/usr/local/bin/getkernel"
-  [[ -e /usr/bin/getkernel ]] && _is_getkernel_symlink /usr/bin/getkernel \
-    && _array_append_unique REMNANT_PATHS "/usr/bin/getkernel"
+_install_dir_from_symlink() {
+  local link=$1
+  local target root
+  [[ -L "$link" ]] || return 1
+  target=$(readlink "$link" 2>/dev/null || true)
+  [[ -n "$target" ]] || return 1
+  if [[ "$target" == *"/.venv/bin/getkernel" ]]; then
+    root="${target%/.venv/bin/getkernel}"
+    [[ -n "$root" ]] || return 1
+    printf '%s\n' "$root"
+    return 0
+  fi
+  return 1
+}
 
-  local home rc
+_append_legacy_path() {
+  local p=$1
+  [[ -z "$p" ]] && return 0
+  if [[ "$p" == "$INSTALL_DIR" ]] || _path_equal "$p" "$INSTALL_DIR"; then
+    return 0
+  fi
+  _array_append_unique LEGACY_PATHS "$p"
+}
+
+detect_installation_state() {
+  EXISTING_SAME_PATH=0
+  LEGACY_PATHS=()
+  LEGACY_RC_FILES=()
+
+  if [[ -e "$INSTALL_DIR" ]] && {
+    [[ -f "$INSTALL_DIR/.getkernel_install" ]] || [[ -f "$INSTALL_DIR/GetKernel.py" ]]
+  }; then
+    EXISTING_SAME_PATH=1
+  fi
+
+  local link dir home local_bin rc candidate
+  for link in /usr/local/bin/getkernel /usr/bin/getkernel; do
+    [[ -e "$link" ]] || continue
+    if dir=$(_install_dir_from_symlink "$link" 2>/dev/null); then
+      if ! _path_equal "$dir" "$INSTALL_DIR"; then
+        _append_legacy_path "$dir"
+        _append_legacy_path "$link"
+      fi
+    elif _is_getkernel_symlink "$link"; then
+      _append_legacy_path "$link"
+    fi
+  done
+
   for home in /root /home/*; do
     [[ -d "$home" ]] || continue
-    if [[ -e "$home/.local/bin/getkernel" ]] && _is_getkernel_symlink "$home/.local/bin/getkernel"; then
-      _array_append_unique REMNANT_PATHS "$home/.local/bin/getkernel"
+    local_bin="$home/.local/bin/getkernel"
+    if [[ -e "$local_bin" ]] && _is_getkernel_symlink "$local_bin"; then
+      if dir=$(_install_dir_from_symlink "$local_bin" 2>/dev/null); then
+        if ! _path_equal "$dir" "$INSTALL_DIR"; then
+          _append_legacy_path "$dir"
+          _append_legacy_path "$local_bin"
+        fi
+      else
+        _append_legacy_path "$local_bin"
+      fi
     fi
     for rc in .profile .bashrc .zshrc; do
-      if [[ -f "$home/$rc" ]] && grep -qF "$MARKER_BEGIN" "$home/$rc" 2>/dev/null; then
-        _array_append_unique REMNANT_RC_FILES "$home/$rc"
+      rc="$home/$rc"
+      if [[ -f "$rc" ]] && grep -qF "$MARKER_BEGIN" "$rc" 2>/dev/null; then
+        if grep -qF "$INSTALL_DIR" "$rc" 2>/dev/null; then
+          continue
+        fi
+        _array_append_unique LEGACY_RC_FILES "$rc"
       fi
     done
+  done
+
+  for candidate in /opt/getkernel /usr/local/GetKernel; do
+    if [[ -f "$candidate/.getkernel_install" ]] && ! _path_equal "$candidate" "$INSTALL_DIR"; then
+      _append_legacy_path "$candidate"
+    fi
   done
 }
 
@@ -197,32 +265,30 @@ remove_path_snippet() {
   mv "$tmp" "$f"
 }
 
-confirm_cleanup() {
-  local total=$(( ${#REMNANT_PATHS[@]} + ${#REMNANT_RC_FILES[@]} ))
-  [[ "$total" -eq 0 ]] && return 0
+confirm_same_path_update() {
+  [[ "$EXISTING_SAME_PATH" -eq 1 ]] || return 0
 
   echo ""
-  ui_section "Previous installation"
-  ui_warn "$total item(s) will be removed before continuing"
-  local p f
-  for p in "${REMNANT_PATHS[@]}"; do
-    ui_item "$p"
-  done
-  for f in "${REMNANT_RC_FILES[@]}"; do
-    ui_item "$f"
-  done
+  ui_section "Existing installation"
+  ui_warn "GetKernel is already installed at $INSTALL_DIR"
+  ui_dim "This run will update program files on top of the existing install."
+  ui_dim "Your runtime data will be kept:"
+  ui_item "data/cache"
+  ui_item "data/logs"
+  ui_item "data/builds"
+  ui_item "data/packages"
 
   if [[ "$ASSUME_YES" -eq 1 ]]; then
-    ui_dim "Confirmed (--yes)"
+    ui_dim "Update confirmed (--yes)"
     return 0
   fi
 
   if [[ ! -t 0 ]] && [[ ! -r /dev/tty ]]; then
-    ui_err "Remnants found — re-run with --yes (no interactive terminal)"
+    ui_err "Existing installation found — re-run with --yes (no interactive terminal)"
     exit 1
   fi
 
-  if ui_prompt "Remove and continue? [y/N]"; then
+  if ui_prompt "Proceed with in-place update? [y/N]"; then
     return 0
   fi
 
@@ -230,12 +296,46 @@ confirm_cleanup() {
   exit 0
 }
 
-cleanup_remnants() {
+confirm_legacy_cleanup() {
+  local total=$(( ${#LEGACY_PATHS[@]} + ${#LEGACY_RC_FILES[@]} ))
+  [[ "$total" -eq 0 ]] && return 1
+
+  echo ""
+  ui_section "Legacy installation (different path)"
+  ui_warn "Found $total item(s) from an older or non-standard GetKernel install"
+  ui_dim "These are not under $INSTALL_DIR and may be removed to avoid conflicts:"
   local p f
-  for p in "${REMNANT_PATHS[@]}"; do
+  for p in "${LEGACY_PATHS[@]}"; do
+    ui_item "$p"
+  done
+  for f in "${LEGACY_RC_FILES[@]}"; do
+    ui_item "$f (PATH snippet)"
+  done
+
+  if [[ "$ASSUME_YES" -eq 1 ]]; then
+    ui_dim "Legacy cleanup confirmed (--yes)"
+    return 0
+  fi
+
+  if [[ ! -t 0 ]] && [[ ! -r /dev/tty ]]; then
+    ui_err "Legacy install paths found — re-run with --yes to remove them, or remove manually"
+    return 1
+  fi
+
+  if ui_prompt "Remove legacy files and data? [y/N]"; then
+    return 0
+  fi
+
+  ui_dim "Skipping legacy cleanup (continuing with install/update)."
+  return 1
+}
+
+cleanup_legacy_paths() {
+  local p f
+  for p in "${LEGACY_PATHS[@]}"; do
     rm -rf "$p"
   done
-  for f in "${REMNANT_RC_FILES[@]}"; do
+  for f in "${LEGACY_RC_FILES[@]}"; do
     remove_path_snippet "$f"
   done
 }
@@ -295,16 +395,20 @@ sync_source() {
     "$INSTALL_DIR/data/packages"
 }
 
-detect_remnants
-confirm_cleanup
-if [[ ${#REMNANT_PATHS[@]} -gt 0 || ${#REMNANT_RC_FILES[@]} -gt 0 ]]; then
-  cleanup_remnants
-  ui_ok "Previous files removed"
+detect_installation_state
+confirm_same_path_update
+if confirm_legacy_cleanup; then
+  cleanup_legacy_paths
+  ui_ok "Legacy installation files removed"
 fi
 
-# ── Install ─────────────────────────────────────────────────────────────────
+# ── Install / update ────────────────────────────────────────────────────────
 echo ""
-ui_section "Install"
+if [[ "$EXISTING_SAME_PATH" -eq 1 ]]; then
+  ui_section "Update"
+else
+  ui_section "Install"
+fi
 
 sync_source
 date -u +"%Y-%m-%dT%H:%M:%SZ" >"$INSTALL_DIR/.getkernel_install"

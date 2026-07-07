@@ -7,7 +7,7 @@ import json
 import sys
 import tarfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
@@ -19,7 +19,7 @@ from utils.constants import (
     KERNEL_ORG_RELEASES_JSON,
 )
 from utils.exceptions import DownloadError, VerificationError
-from utils.helpers import cdn_source_url, kernel_major_branch, project_root
+from utils.helpers import cdn_source_url, kernel_major_branch, project_root, run_cmd
 from utils.validator import safe_extract_path
 
 
@@ -43,12 +43,31 @@ class KernelFetcher:
         )
         self._download_progress = 0.0
         self._releases_cache: Optional[Dict[str, Any]] = None
+        self.verify_checksum_enabled = True
+        self.verify_signature_enabled = False
+        self.include_beta = True
+        self.include_rc = True
+
+    @classmethod
+    def from_config(
+        cls,
+        cache_dir: Optional[str],
+        kernel_cfg: Mapping[str, Any],
+    ) -> "KernelFetcher":
+        fetcher = cls(cache_dir)
+        fetcher.verify_checksum_enabled = bool(kernel_cfg.get("verify_checksum", True))
+        fetcher.verify_signature_enabled = bool(kernel_cfg.get("verify_signature", False))
+        fetcher.include_beta = bool(kernel_cfg.get("include_beta", True))
+        fetcher.include_rc = bool(kernel_cfg.get("include_rc", True))
+        return fetcher
 
     def fetch_kernel_versions(
         self,
-        include_beta: bool = True,
-        include_rc: bool = True,
+        include_beta: Optional[bool] = None,
+        include_rc: Optional[bool] = None,
     ) -> Dict[str, Any]:
+        ib = self.include_beta if include_beta is None else include_beta
+        ir = self.include_rc if include_rc is None else include_rc
         try:
             r = self.session.get(self.releases_api, timeout=60)
             r.raise_for_status()
@@ -90,7 +109,10 @@ class KernelFetcher:
                 if moniker == "mainline":
                     mainline_ver = ver
                 is_rc = "rc" in ver.lower()
-                if is_rc and not include_rc:
+                if is_rc and not ir:
+                    continue
+                is_beta = "beta" in ver.lower()
+                if is_beta and not ib:
                     continue
                 versions.append(
                     {
@@ -118,7 +140,10 @@ class KernelFetcher:
                 if not ver:
                     return
                 is_rc = "rc" in ver.lower()
-                if is_rc and not include_rc:
+                if is_rc and not ir:
+                    return
+                is_beta = "beta" in ver.lower()
+                if is_beta and not ib:
                     return
                 versions.append(
                     {
@@ -235,15 +260,19 @@ class KernelFetcher:
             (path_to_source_tree, status) where status is ``reuse_tree``,
             ``reuse_tarball``, ``resume`` (continued partial download), or ``fresh``.
         """
-        _ = verify_signature  # optional gpg not implemented; checksum always used if available
+        do_verify_sig = verify_signature and self.verify_signature_enabled
         meta = self.fetch_kernel_versions()
         url = ""
+        pgp_url = ""
         for v in meta.get("versions", []):
             if v.get("version") == version:
                 url = v.get("source_url") or ""
+                pgp_url = v.get("pgp_url") or ""
                 break
         if not url:
             url = cdn_source_url(version, self.cdn_url)
+        if not pgp_url and url.endswith(".xz"):
+            pgp_url = url + ".sign"
 
         parent = Path(target_dir) if target_dir else project_root() / "data" / "builds"
         parent.mkdir(parents=True, exist_ok=True)
@@ -279,14 +308,17 @@ class KernelFetcher:
                 status = "fresh"
 
         if need_download:
-            self._download_file(url, tarball, start_byte=resume_from)
+            self._download_from_mirrors(version, url, tarball, start_byte=resume_from)
             expected_hash = self._fetch_sha256_for_tarball(version, tarball.name)
-            if expected_hash and not self.verify_checksum(str(tarball), expected_hash):
-                raise VerificationError("SHA256 checksum mismatch for kernel tarball")
+            self._assert_tarball_integrity(tarball, expected_hash)
+            if do_verify_sig and pgp_url:
+                self._verify_gpg_signature(tarball, pgp_url)
             if status != "resume":
                 status = "fresh"
-        elif expected_hash and not self.verify_checksum(str(tarball), expected_hash):
-            raise VerificationError("SHA256 checksum mismatch for cached kernel tarball")
+        else:
+            self._assert_tarball_integrity(tarball, expected_hash)
+            if do_verify_sig and pgp_url:
+                self._verify_gpg_signature(tarball, pgp_url)
 
         extract_root = parent
         if self.is_kernel_source_tree(extract_dir):
@@ -312,10 +344,14 @@ class KernelFetcher:
             return "corrupt"
 
         size = tarball.stat().st_size
-        if expected_hash and self.verify_checksum(str(tarball), expected_hash):
-            return "complete"
+        if expected_hash and self.verify_checksum_enabled:
+            if self.verify_checksum(str(tarball), expected_hash):
+                return "complete"
+        elif expected_hash is None or not self.verify_checksum_enabled:
+            if remote_size and size >= remote_size and self._tarball_is_valid_archive(tarball):
+                return "complete"
 
-        if expected_hash:
+        if expected_hash and self.verify_checksum_enabled:
             if remote_size and size < remote_size:
                 return "partial"
             return "corrupt"
@@ -371,6 +407,60 @@ class KernelFetcher:
             if len(parts) >= 2 and parts[1].endswith(filename):
                 return parts[0].lower()
         return None
+
+    def _assert_tarball_integrity(
+        self,
+        tarball: Path,
+        expected_hash: Optional[str],
+    ) -> None:
+        if not self.verify_checksum_enabled or not expected_hash:
+            return
+        if not self.verify_checksum(str(tarball), expected_hash):
+            raise VerificationError("SHA256 checksum mismatch for kernel tarball")
+
+    def _mirror_urls(self, version: str, primary_url: str) -> List[str]:
+        urls: List[str] = []
+        for mirror in CDN_MIRRORS:
+            candidate = cdn_source_url(version, mirror)
+            if candidate not in urls:
+                urls.append(candidate)
+        if primary_url and primary_url not in urls:
+            urls.insert(0, primary_url)
+        return urls
+
+    def _download_from_mirrors(
+        self,
+        version: str,
+        primary_url: str,
+        dest: Path,
+        *,
+        start_byte: int = 0,
+    ) -> None:
+        errors: List[str] = []
+        for url in self._mirror_urls(version, primary_url):
+            try:
+                self._download_file(url, dest, start_byte=start_byte)
+                return
+            except DownloadError as exc:
+                errors.append(f"{url}: {exc}")
+                if dest.is_file() and start_byte == 0:
+                    dest.unlink(missing_ok=True)
+        raise DownloadError(
+            "Download failed on all CDN mirrors:\n" + "\n".join(errors)
+        )
+
+    def _verify_gpg_signature(self, tarball: Path, sign_url: str) -> None:
+        sign_path = tarball.with_name(tarball.name + ".sign")
+        try:
+            resp = self.session.get(sign_url, timeout=120)
+            resp.raise_for_status()
+            sign_path.write_bytes(resp.content)
+        except requests.RequestException as exc:
+            raise VerificationError(f"Failed to download signature: {exc}") from exc
+        cp = run_cmd(["gpg", "--verify", str(sign_path), str(tarball)])
+        if cp.returncode != 0:
+            detail = (cp.stderr or cp.stdout or "").strip()
+            raise VerificationError(f"GPG verification failed: {detail}")
 
     def _download_file(self, url: str, dest: Path, start_byte: int = 0) -> None:
         if not url.startswith("https://"):
