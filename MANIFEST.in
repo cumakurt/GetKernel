@@ -1,4 +1,24 @@
+# Documentation
 include README.md
 include LICENSE
+include CONTRIBUTING.md
+include SECURITY.md
 include requirements.txt
-recursive-include config *.yaml *.cfg
+
+# Shipped configuration (runtime defaults and examples)
+include config/default_config.yaml
+include config/user_config.yaml.example
+recursive-include config/fragments *.cfg
+
+# System installer (also copied by install.sh)
+include install.sh
+recursive-include scripts *.sh
+
+# Exclude non-package paths from source distributions
+global-exclude *.py[cod] __pycache__ .DS_Store
+prune tests
+prune img
+prune .github
+prune .cursor
+prune .venv
+prune venv
