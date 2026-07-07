@@ -1,5 +1,4 @@
 include README.md
-include README_TR.md
 include LICENSE
 include requirements.txt
 recursive-include config *.yaml *.cfg

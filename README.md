@@ -16,8 +16,6 @@
 
 Python tool for Debian-based systems to list kernels from kernel.org, optionally download sources, reuse your running kernel configuration, build `bindeb-pkg` / `deb-pkg` kernel packages, and install them with backup hooks.
 
-**Other languages:** [Türkçe — README_TR.md](README_TR.md)
-
 ## Requirements
 
 - Python 3.8+
