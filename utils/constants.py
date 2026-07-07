@@ -1,6 +1,11 @@
 """Shared constants."""
 
+from pathlib import Path
+
 APP_VERSION = "1.0.0"
+
+GETKERNEL_INSTALL_DIR = Path("/usr/local/getkernel")
+GETKERNEL_INSTALL_MARKER = ".getkernel_install"
 
 DEVELOPER_NAME = "Cuma KURT"
 DEVELOPER_EMAIL = "cumakurt@gmail.com"

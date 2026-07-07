@@ -43,6 +43,7 @@ from utils.helpers import (
 from utils.logger import log_build_event, log_exception, setup_logging
 from utils.ui import (
     banner,
+    build_progress_display,
     confirm,
     print_build_step_summary,
     print_build_success_summary,
@@ -103,63 +104,42 @@ def _collect_config_fragments(
     return uniq
 
 
-def _prompt_existing_packages_action(
+def _prompt_rebuild_or_quit(
     version: str,
     pkg_out: Path,
     debs: List[Path],
-    skip_install: bool,
 ) -> str:
-    """Return ``install``, ``rebuild``, or ``quit``."""
+    """Return ``rebuild`` or ``quit`` when stored packages exist (depot install is disabled)."""
     click.echo("")
     click.echo(
         click.style(
-            "Previously built packages found for this kernel version.",
+            "Stored packages for this kernel version already exist in the package depot.",
             fg="yellow",
             bold=True,
         )
     )
+    click.echo(
+        "Only a fresh build can be installed; stored packages are not offered for installation."
+    )
+    click.echo(f"  Version: {version}")
     click.echo(f"  Directory: {pkg_out / 'latest'}")
     for p in debs:
         click.echo(f"  • {p.name}")
-    if skip_install:
-        click.echo(
-            click.style(
-                "(--skip-install) Rebuild or quit only; install is disabled.",
-                fg="dim",
-            )
-        )
-        if not sys.stdin.isatty():
-            return "rebuild"
-        c = click.prompt(
-            "Choice [r]ebuild / [q]uit",
-            default="r",
-            type=click.Choice(["r", "q"], case_sensitive=False),
-        )
-        return "quit" if c == "q" else "rebuild"
     if not sys.stdin.isatty():
         click.echo(
             click.style(
-                "Non-interactive: rebuilding. "
-                "Set GETKERNEL_EXISTING=install to install existing packages only, "
-                "or use --force-rebuild.",
+                "Non-interactive: rebuilding. Use --force-rebuild to skip this notice.",
                 fg="dim",
             ),
             err=True,
         )
-        if os.environ.get("GETKERNEL_EXISTING", "").strip().lower() in (
-            "install",
-            "i",
-            "1",
-            "yes",
-        ):
-            return "install"
         return "rebuild"
     c = click.prompt(
-        "Choice [i]nstall / [r]ebuild / [q]uit",
-        default="i",
-        type=click.Choice(["i", "r", "q"], case_sensitive=False),
+        "Choice [r]ebuild / [q]uit",
+        default="r",
+        type=click.Choice(["r", "q"], case_sensitive=False),
     )
-    return {"i": "install", "r": "rebuild", "q": "quit"}[c]
+    return "quit" if c == "q" else "rebuild"
 
 
 def _install_kernel_packages_phase(
@@ -171,23 +151,18 @@ def _install_kernel_packages_phase(
     log: logging.Logger,
     *,
     build_log: Optional[Path] = None,
-    existing_packages_only: bool = False,
 ) -> None:
-    """After packages are ready: success message, optional install (default yes)."""
+    """After a fresh build: success message and optional install prompt (latest build only)."""
     if not moved:
         return
     if skip_install:
-        if not existing_packages_only:
-            print_build_success_summary(len(moved), moved[0].parent, build_log)
+        print_build_success_summary(len(moved), moved[0].parent, build_log)
         click.echo("Packages:")
         for p in moved:
             click.echo(f"  {p}")
         click.echo("Skipping installation (--skip-install).")
         return
-    if not existing_packages_only:
-        print_build_success_summary(len(moved), moved[0].parent, build_log)
-    else:
-        click.echo(click.style("These packages are ready to install.", fg="green"))
+    print_build_success_summary(len(moved), moved[0].parent, build_log)
     inst = Installer()
     install_yes = assume_yes_install or assume_yes_from_env()
     if not inst.request_installation_approval(
@@ -398,6 +373,7 @@ def run_build_flow(
     assume_yes_install: bool = False,
     packages_output_dir: Optional[str] = None,
     quiet_build: bool = False,
+    verbose_build: bool = False,
     config_fragments: Optional[List[str]] = None,
     use_llvm: bool = False,
     localmodconfig: bool = False,
@@ -451,22 +427,8 @@ def run_build_flow(
     if reuse_allowed:
         existing = find_matching_stored_packages(pkg_out, version, localver)
         if existing:
-            action = _prompt_existing_packages_action(
-                version, pkg_out, existing, skip_install
-            )
+            action = _prompt_rebuild_or_quit(version, pkg_out, existing)
             if action == "quit":
-                return
-            if action == "install":
-                _install_kernel_packages_phase(
-                    existing,
-                    version,
-                    localver,
-                    skip_install,
-                    assume_yes_install,
-                    log,
-                    build_log=None,
-                    existing_packages_only=True,
-                )
                 return
 
     _ensure_build_dependencies(cfg, log)
@@ -493,6 +455,8 @@ def run_build_flow(
             click.echo(click.style("Reusing existing source tree (skip download).", fg="green"))
         elif prep_status == "reuse_tarball":
             click.echo(click.style("Reusing cached tarball (skip download).", fg="green"))
+        elif prep_status == "resume":
+            click.echo(click.style("Resuming interrupted download …", fg="green"))
         src = Path(extracted)
 
     use_llvm_build = bool(build_cfg.get("use_llvm", False)) or use_llvm
@@ -555,18 +519,28 @@ def run_build_flow(
         )
         if use_llvm_build:
             click.echo("Building with LLVM=1 (clang); ensure clang/llvm are installed.", err=True)
-        click.echo(f"Starting build (make {make_t}); full log → {build_log}")
-        if quiet_build:
-            click.echo("(quiet terminal: make output only in log file)", err=True)
-        comp.compile_kernel(
-            target=pkg_target,
-            jobs=build_cfg.get("jobs"),
-            local_version=localver,
-            verbose=not quiet_build,
-            log_path=build_log,
-            build_id=build_id,
-            use_llvm=use_llvm_build,
-        )
+
+        compile_kwargs = {
+            "target": pkg_target,
+            "jobs": build_cfg.get("jobs"),
+            "local_version": localver,
+            "log_path": build_log,
+            "build_id": build_id,
+            "use_llvm": use_llvm_build,
+        }
+        if verbose_build:
+            click.echo(f"Starting build (make {make_t}); full log → {build_log}")
+            comp.compile_kernel(**compile_kwargs, verbose=True)
+        elif quiet_build:
+            click.echo(f"Building (make {make_t}); log → {build_log}")
+            comp.compile_kernel(**compile_kwargs, verbose=False)
+        else:
+            with build_progress_display(build_log, make_t) as on_progress:
+                comp.compile_kernel(
+                    **compile_kwargs,
+                    verbose=False,
+                    progress_callback=on_progress,
+                )
         log_build_event(
             log,
             "build_done",
@@ -608,7 +582,6 @@ def run_build_flow(
         assume_yes_install,
         log,
         build_log=last_build_log,
-        existing_packages_only=False,
     )
 
 
@@ -646,7 +619,14 @@ def run_build_flow(
     "-q",
     "quiet_build",
     is_flag=True,
-    help="Do not print make output to the terminal (full log is still written to a file).",
+    help="Minimal terminal output during build (no live progress panel; log file only).",
+)
+@click.option(
+    "--verbose",
+    "-v",
+    "verbose_build",
+    is_flag=True,
+    help="Stream full make output to the terminal (disables live progress panel).",
 )
 @click.option(
     "--fragment",
@@ -682,12 +662,15 @@ def cmd_build(
     config_path: Optional[str],
     packages_output_dir: Optional[str],
     quiet_build: bool,
+    verbose_build: bool,
     config_fragments: tuple,
     use_llvm: bool,
     use_localmodconfig: bool,
     force_rebuild: bool,
 ) -> None:
     """Download kernel, configure from running system, compile deb-pkg."""
+    if quiet_build and verbose_build:
+        raise click.UsageError("--quiet and --verbose cannot be used together.")
     install_yes = bool(ctx.obj.get("assume_yes")) or assume_yes_from_env()
     frags = list(config_fragments) if config_fragments else None
     run_build_flow(
@@ -699,6 +682,7 @@ def cmd_build(
         assume_yes_install=install_yes,
         packages_output_dir=packages_output_dir,
         quiet_build=quiet_build,
+        verbose_build=verbose_build,
         config_fragments=frags,
         use_llvm=use_llvm,
         localmodconfig=use_localmodconfig,

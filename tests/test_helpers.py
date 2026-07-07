@@ -49,5 +49,23 @@ class TestAssumeYesEnv(unittest.TestCase):
             os.environ.pop("GETKERNEL_ASSUME_YES", None)
 
 
+class TestProjectRoot(unittest.TestCase):
+    def test_getkernel_root_override(self) -> None:
+        import os
+        import tempfile
+        from pathlib import Path
+
+        from utils.helpers import project_root
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "GetKernel.py").write_text("# stub\n", encoding="utf-8")
+            os.environ["GETKERNEL_ROOT"] = str(root)
+            try:
+                self.assertEqual(project_root(), root.resolve())
+            finally:
+                os.environ.pop("GETKERNEL_ROOT", None)
+
+
 if __name__ == "__main__":
     unittest.main()

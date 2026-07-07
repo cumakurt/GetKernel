@@ -45,7 +45,7 @@ class Installer:
                 size_mib = 0
             print(f"  - {p} ({size_mib} MiB)")
         return confirm(
-            "Install these packages on this system now?",
+            "Install these newly built packages on this system now?",
             default=default_confirm,
         )
 

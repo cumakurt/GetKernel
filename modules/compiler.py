@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Mapping, Optional
 
@@ -15,30 +16,116 @@ from utils.constants import COMPILATION_ERROR_HINTS
 from utils.exceptions import CompilationError
 from utils.helpers import project_root, run_cmd
 
+PHASE_LABELS = {
+    "starting": "Starting build",
+    "preparing": "Preparing kernel tree",
+    "compiling": "Compiling source files",
+    "linking": "Linking kernel image",
+    "modules": "Building kernel modules",
+    "packaging": "Creating Debian packages",
+    "finishing": "Finishing up",
+}
+
+
+@dataclass(frozen=True)
+class BuildProgressSnapshot:
+    phase: str
+    phase_label: str
+    percent: float
+    activity: str
+    elapsed_seconds: float
+    eta_seconds: Optional[float]
+    units_done: int
+
 
 class CompilationProgress:
-    """Rough progress from make stdout lines."""
+    """Rough live progress parsed from make stdout."""
 
-    # Fixed scale avoids scanning tens of thousands of *.c files at build start.
     _APPROX_SOURCE_FILES = 25000
 
-    def __init__(self, source_dir: Path):
+    _PHASE_RULES: List[tuple[re.Pattern[str], str]] = [
+        (re.compile(r"dpkg-deb|bindeb-pkg|\.deb\b|debian/rules|dh_", re.I), "packaging"),
+        (re.compile(r"Building modules|MODPOST|__modpost|\bLD \[M\]", re.I), "modules"),
+        (re.compile(r"\bLD\b.*vmlinux|LINK\s|\bvmlinux\b|bzImage|\bImage:", re.I), "linking"),
+        (re.compile(r"Syncconfig|HOSTCC|HOSTLD|GEN\s|scripts/kconfig", re.I), "preparing"),
+    ]
+
+    def __init__(self, source_dir: Path, started_at: Optional[float] = None):
         self.source_dir = source_dir
         self.total_files = self._APPROX_SOURCE_FILES
         self.compiled_files = 0
+        self.phase = "starting"
+        self.activity = "Waiting for make output …"
+        self.started_at = started_at or time.time()
 
     def update(self, log_line: str) -> None:
-        if re.search(r"\b(CC|LD|AS|AR)\b", log_line):
+        stripped = log_line.strip()
+        if not stripped:
+            return
+
+        for pattern, phase in self._PHASE_RULES:
+            if pattern.search(stripped):
+                self.phase = phase
+                break
+
+        if re.search(r"\b(CC|LD|AS|AR)\b", stripped):
             self.compiled_files += 1
+            if self.phase in ("starting", "preparing"):
+                self.phase = "compiling"
+            if re.search(r"\bLD \[M\]|MODPOST", stripped):
+                self.phase = "modules"
+            elif re.search(r"\bLD\b", stripped) and "vmlinux" in stripped.lower():
+                self.phase = "linking"
+
+        activity = self._format_activity(stripped)
+        if activity:
+            self.activity = activity
+
+    @staticmethod
+    def _format_activity(line: str) -> str:
+        match = re.search(r"\b(CC|LD|AS|AR|HOSTCC|HOSTLD|GEN)\s+(\S+)", line)
+        if match:
+            tool, target = match.group(1), match.group(2)
+            name = Path(target).name
+            return f"{tool} {name}"
+        if len(line) > 80:
+            return line[:77] + "…"
+        return line
 
     def get_percentage(self) -> float:
-        return min(100.0, (self.compiled_files / self.total_files) * 100.0)
+        if self.phase == "packaging":
+            return min(100.0, 92.0 + (self.compiled_files % 50) * 0.15)
+        if self.phase == "finishing":
+            return 100.0
+        return min(90.0, (self.compiled_files / self.total_files) * 90.0)
+
+    def eta_seconds(self) -> Optional[float]:
+        pct = self.get_percentage()
+        if pct < 2.0:
+            return None
+        elapsed = max(0.0, time.time() - self.started_at)
+        remaining = pct
+        if remaining <= 0:
+            return None
+        return elapsed * (100.0 - pct) / pct
+
+    def snapshot(self, *, final: bool = False) -> BuildProgressSnapshot:
+        phase = "finishing" if final else self.phase
+        pct = 100.0 if final else self.get_percentage()
+        return BuildProgressSnapshot(
+            phase=phase,
+            phase_label=PHASE_LABELS.get(phase, phase.replace("_", " ").title()),
+            percent=pct,
+            activity=self.activity if not final else "Build complete",
+            elapsed_seconds=max(0.0, time.time() - self.started_at),
+            eta_seconds=None if final else self.eta_seconds(),
+            units_done=self.compiled_files,
+        )
 
 
 class Compiler:
     """Run make bindeb-pkg or deb-pkg in a kernel tree."""
 
-    # Short aliases -> GNU make target names
     TARGETS = {
         "deb": "deb-pkg",
         "bindeb": "bindeb-pkg",
@@ -56,13 +143,6 @@ class Compiler:
         self._ccache_env: Dict[str, str] = {}
 
     def resolve_make_package_target(self, target: str) -> tuple[str, bool]:
-        """
-        Map config/CLI to a real make target.
-
-        ``deb-pkg`` builds Debian *source* packages and recent kernels require a git
-        checkout (scripts/Makefile.package: check-git). Tarballs from kernel.org are not
-        git repos, so we fall back to ``bindeb-pkg`` (binary linux-image/linux-headers only).
-        """
         t = (target or "bindeb-pkg").strip().lower()
         if t in self.TARGETS:
             t = self.TARGETS[t]
@@ -100,8 +180,8 @@ class Compiler:
         target: str = "bindeb-pkg",
         jobs: Optional[int] = None,
         local_version: str = "-getkernel",
-        verbose: bool = True,
-        progress_callback: Optional[Callable[[float], None]] = None,
+        verbose: bool = False,
+        progress_callback: Optional[Callable[[BuildProgressSnapshot], None]] = None,
         log_path: Optional[Path] = None,
         build_id: Optional[str] = None,
         use_llvm: bool = False,
@@ -117,12 +197,13 @@ class Compiler:
         j = jobs if jobs else self.cpu_count
         self.compilation_start_time = time.time()
         self.build_id = build_id
-        self._progress_helper = CompilationProgress(self.source_dir)
+        self._progress_helper = CompilationProgress(
+            self.source_dir, started_at=self.compilation_start_time
+        )
         env = os.environ.copy()
         env["LOCALVERSION"] = local_version
         env.setdefault("KBUILD_BUILD_USER", "getkernel")
         env.setdefault("KBUILD_BUILD_HOST", "localhost")
-        # Apply ccache env overrides (set by enable_ccache)
         env.update(self._ccache_env)
         if use_llvm:
             env["LLVM"] = "1"
@@ -132,6 +213,9 @@ class Compiler:
         log_file = log_path or (project_root() / "data" / "logs" / "build.log")
         log_file.parent.mkdir(parents=True, exist_ok=True)
         self.last_build_log_path = log_file
+
+        if progress_callback and self._progress_helper:
+            progress_callback(self._progress_helper.snapshot())
 
         cmd = ["make", f"-j{j}", make_target]
         proc = subprocess.Popen(
@@ -156,18 +240,23 @@ class Compiler:
                     if self._progress_helper:
                         self._progress_helper.update(line)
                         if progress_callback:
-                            progress_callback(self._progress_helper.get_percentage())
+                            progress_callback(self._progress_helper.snapshot())
         rc = proc.wait()
         elapsed = time.time() - (self.compilation_start_time or time.time())
         self.estimated_duration = elapsed
+
+        if self._progress_helper and progress_callback:
+            progress_callback(self._progress_helper.snapshot(final=True))
+
         summary = (
             f"Build log ({line_count} lines, {elapsed:.1f}s): {log_file}"
             + (f"  [build_id={build_id}]" if build_id else "")
         )
-        if not verbose:
-            print(summary, file=sys.stderr)
-        else:
+        if verbose:
             print(f"\n{summary}", file=sys.stderr)
+        elif not progress_callback:
+            print(summary, file=sys.stderr)
+
         if rc != 0:
             tail = "".join(self._log_lines[-80:])
             full_for_hint = "".join(self._log_lines[-400:])
@@ -204,6 +293,9 @@ class Compiler:
         return None
 
     def get_remaining_time(self) -> Optional[int]:
+        if self._progress_helper:
+            eta = self._progress_helper.eta_seconds()
+            return int(eta) if eta is not None else None
         return None
 
     def handle_compilation_error(self, error_output: str) -> Dict[str, str]:

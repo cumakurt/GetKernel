@@ -232,8 +232,8 @@ class KernelFetcher:
         Download (if needed) and extract kernel source.
 
         Returns:
-            (path_to_source_tree, status) where status is ``reuse_tree``, ``reuse_tarball``,
-            or ``fresh`` (downloaded new tarball).
+            (path_to_source_tree, status) where status is ``reuse_tree``,
+            ``reuse_tarball``, ``resume`` (continued partial download), or ``fresh``.
         """
         _ = verify_signature  # optional gpg not implemented; checksum always used if available
         meta = self.fetch_kernel_versions()
@@ -258,32 +258,104 @@ class KernelFetcher:
             return str(extract_dir), "reuse_tree"
 
         expected_hash = self._fetch_sha256_for_tarball(version, tarball.name)
+        remote_size = self._head_content_length(url)
+        resume_from = 0
         need_download = True
-        if reuse_existing and tarball.is_file() and tarball.stat().st_size > 0:
-            if expected_hash:
-                if self.verify_checksum(str(tarball), expected_hash):
-                    need_download = False
-                else:
-                    tarball.unlink(missing_ok=True)
-            else:
+        status = "fresh"
+
+        if reuse_existing and tarball.is_file():
+            tarball_state = self._classify_tarball(
+                tarball, expected_hash=expected_hash, remote_size=remote_size
+            )
+            if tarball_state == "complete":
                 need_download = False
+                status = "reuse_tarball"
+            elif tarball_state == "partial":
+                resume_from = tarball.stat().st_size
+                status = "resume"
+            else:
+                tarball.unlink(missing_ok=True)
+                need_download = True
+                status = "fresh"
 
         if need_download:
-            self._download_file(url, tarball)
+            self._download_file(url, tarball, start_byte=resume_from)
             expected_hash = self._fetch_sha256_for_tarball(version, tarball.name)
             if expected_hash and not self.verify_checksum(str(tarball), expected_hash):
                 raise VerificationError("SHA256 checksum mismatch for kernel tarball")
-            status = "fresh"
-        else:
-            if expected_hash and not self.verify_checksum(str(tarball), expected_hash):
-                raise VerificationError("SHA256 checksum mismatch for cached kernel tarball")
-            status = "reuse_tarball"
+            if status != "resume":
+                status = "fresh"
+        elif expected_hash and not self.verify_checksum(str(tarball), expected_hash):
+            raise VerificationError("SHA256 checksum mismatch for cached kernel tarball")
 
         extract_root = parent
         if self.is_kernel_source_tree(extract_dir):
             return str(extract_dir), status
         extracted = self.extract_tarball(str(tarball), str(extract_root))
         return extracted, status
+
+    def _classify_tarball(
+        self,
+        tarball: Path,
+        *,
+        expected_hash: Optional[str],
+        remote_size: Optional[int],
+    ) -> str:
+        """
+        Classify an on-disk tarball as complete, partial, or corrupt.
+
+        ``complete`` — checksum OK, or size matches remote when no hash is published.
+        ``partial`` — smaller than remote (or unreadable archive) and may be resumed.
+        ``corrupt`` — wrong checksum with full size, empty, or unusable; delete and retry.
+        """
+        if not tarball.is_file() or tarball.stat().st_size <= 0:
+            return "corrupt"
+
+        size = tarball.stat().st_size
+        if expected_hash and self.verify_checksum(str(tarball), expected_hash):
+            return "complete"
+
+        if expected_hash:
+            if remote_size and size < remote_size:
+                return "partial"
+            return "corrupt"
+
+        if remote_size:
+            if size < remote_size:
+                return "partial"
+            if size >= remote_size and self._tarball_is_valid_archive(tarball):
+                return "complete"
+            return "corrupt"
+
+        if self._tarball_is_valid_archive(tarball):
+            return "complete"
+        return "corrupt"
+
+    @staticmethod
+    def _tarball_is_valid_archive(path: Path) -> bool:
+        """Lightweight integrity probe when no SHA256 is available."""
+        try:
+            if path.name.endswith(".tar.gz") or path.suffix == ".gz":
+                mode = "r:gz"
+            else:
+                mode = "r:xz"
+            with tarfile.open(path, mode) as tf:  # type: ignore[arg-type]
+                if not tf.getnames():
+                    return False
+            return True
+        except (tarfile.TarError, OSError):
+            return False
+
+    def _head_content_length(self, url: str) -> Optional[int]:
+        try:
+            resp = self.session.head(url, timeout=60, allow_redirects=True)
+            resp.raise_for_status()
+            raw = resp.headers.get("Content-Length")
+            if raw and str(raw).isdigit():
+                return int(raw)
+        except requests.RequestException:
+            return None
+        return None
 
     def _fetch_sha256_for_tarball(self, version: str, filename: str) -> Optional[str]:
         url = self._sha256sums_url(version)
@@ -300,34 +372,70 @@ class KernelFetcher:
                 return parts[0].lower()
         return None
 
-    def _download_file(self, url: str, dest: Path) -> None:
+    def _download_file(self, url: str, dest: Path, start_byte: int = 0) -> None:
         if not url.startswith("https://"):
             from utils.exceptions import SecurityError
 
             raise SecurityError("Only HTTPS downloads are allowed")
-        self._download_progress = 0.0
+
+        headers: Dict[str, str] = {}
+        mode = "wb"
+        done = 0
+        if start_byte > 0:
+            headers["Range"] = f"bytes={start_byte}-"
+            mode = "ab"
+            done = start_byte
+
+        self._download_progress = (done / max(done, 1)) * 100.0 if done else 0.0
         try:
-            with self.session.get(url, stream=True, timeout=600) as resp:
-                resp.raise_for_status()
-                total = int(resp.headers.get("Content-Length") or 0)
-                done = 0
+            with self.session.get(
+                url, stream=True, headers=headers, timeout=600
+            ) as resp:
+                if start_byte > 0:
+                    if resp.status_code == 416:
+                        raise DownloadError(
+                            "Resume failed: server rejected the byte range "
+                            f"(local size {start_byte} bytes)."
+                        )
+                    if resp.status_code == 200:
+                        mode = "wb"
+                        done = 0
+                        start_byte = 0
+                    elif resp.status_code != 206:
+                        resp.raise_for_status()
+                else:
+                    resp.raise_for_status()
+
+                chunk_total = int(resp.headers.get("Content-Length") or 0)
+                if start_byte > 0 and resp.status_code == 206:
+                    total = start_byte + chunk_total
+                else:
+                    total = chunk_total
+
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                # Use Rich progress bar when a TTY is available
                 use_progress = sys.stderr.isatty() and total > 0
                 if use_progress:
                     from utils.ui import progress_download
+
                     progress = progress_download()
-                    task = progress.add_task(f"Downloading {dest.name}", total=total)
+                    label = (
+                        f"Resuming {dest.name}"
+                        if start_byte > 0
+                        else f"Downloading {dest.name}"
+                    )
+                    task = progress.add_task(label, total=total, completed=done)
                     progress.start()
                 try:
-                    with open(dest, "wb") as f:
+                    with open(dest, mode) as f:
                         for chunk in resp.iter_content(chunk_size=1024 * 256):
                             if not chunk:
                                 continue
                             f.write(chunk)
                             done += len(chunk)
                             if total:
-                                self._download_progress = min(100.0, (done / total) * 100.0)
+                                self._download_progress = min(
+                                    100.0, (done / total) * 100.0
+                                )
                             if use_progress:
                                 progress.update(task, advance=len(chunk))  # type: ignore[possibly-undefined]
                 finally:

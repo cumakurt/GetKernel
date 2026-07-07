@@ -16,7 +16,7 @@ Debian tabanlı sistemlerde kernel.org üzerinden çekirdek sürümlerini listel
 
 ## Kurulum
 
-Hızlı kurulum (`.venv` oluşturur, `pyproject.toml` üzerinden kurar):
+Hızlı kurulum (projeyi `/usr/local/getkernel` altına kopyalar, orada `.venv` oluşturur, `pyproject.toml` üzerinden kurar):
 
 ```bash
 cd GetKernel
@@ -24,14 +24,15 @@ chmod +x install.sh   # gerekirse bir kez
 sudo ./install.sh     # isteğe bağlı: sudo ./install.sh --dev  (pytest vb.)
 ```
 
-**Yönetici (sudo) gerekir.** `./install.sh`’i `sudo` olmadan çalıştırırsanız betik kendini `sudo` ile yeniden çalıştırır ve parola ister. `sudo` kullandığınızda `.venv` dizini sizin kullanıcı adınıza atanır (kod düzenleme ve çalıştırma için root gerekmez).
+**Yönetici (sudo) gerekir.** `./install.sh`’i `sudo` olmadan çalıştırırsanız betik kendini `sudo` ile yeniden çalıştırır ve parola ister.
 
-Kurulum betiği **`getkernel`’i PATH’e ekler**; yeni kabuklarda ve yeniden önyüklemeden sonra çalışır:
+Eski GetKernel kalıntıları bulunursa (önceki kurulum dizini, sembolik bağlantılar veya kabuk PATH blokları) betik bunları listeler ve silmeden önce onay ister. Onayı atlamak için `--yes` kullanın.
 
-- `sudo ./install.sh` sonrası: **`SUDO_USER`** için `~/.local/bin/getkernel` **ve** sistem geneli **`/usr/local/bin/getkernel`** (root kabuğunda da çalışır; PATH’te `/usr/local/bin` olan herkes için).
-- Root oturumunda `sudo` yoksa (`SUDO_USER` boş): yalnızca `/usr/local/bin/getkernel`.
+Kurulum betiği dosyaları **`/usr/local/getkernel`** altına yerleştirir ve **`/usr/local/bin/getkernel`** sembolik bağlantısını ekler (PATH’te `/usr/local/bin` olan tüm kullanıcılar için).
 
-Mevcut kabukta `PATH` için **yeni terminal** veya bir kez `source ~/.profile`. Genel entegrasyon istemezseniz: `sudo ./install.sh --no-symlink`. Sudo zorunluluğunu yalnızca özel ortamlarda atlamak için: `GETKERNEL_ALLOW_USER_INSTALL=1 ./install.sh`.
+Kurulumdan sonra indirilen çekirdek kaynakları, derleme ağaçları, günlükler ve paket çıktıları `/usr/local/getkernel/data/` altında tutulur (cache, builds, logs, packages).
+
+Genel sembolik bağlantı istemezseniz: `sudo ./install.sh --no-symlink` (ardından `source /usr/local/getkernel/.venv/bin/activate` veya `/usr/local/getkernel/.venv/bin/getkernel`).
 
 Manuel kurulum:
 
@@ -253,9 +254,17 @@ sudo getkernel build --version 6.12.8 --llvm
 
 Alternatif: `config/user_config.yaml` içinde `build.use_llvm: true`.
 
-### 13. Derleme sırasında sessiz uç birimi
+### 13. Derleme ilerlemesi (terminal)
 
-Terminalde `make` çıktısını göstermez; tam günlük yine `data/logs/build-<id>.log` dosyasına yazılır:
+Varsayılan olarak GetKernel **canlı ilerleme paneli** gösterir (aşama, yüzde çubuğu, ETA, son işlem). Tam `make` çıktısı her zaman `data/logs/build-<id>.log` dosyasına yazılır.
+
+Tüm `make` satırlarını terminale aktarmak için:
+
+```bash
+sudo getkernel build --version 6.12.8 --verbose
+```
+
+Minimal çıktı (panel yok; yalnızca log dosyası):
 
 ```bash
 sudo getkernel build --version 6.12.8 --quiet
@@ -283,19 +292,14 @@ Paket meta verisi için sürüm dizesini bu ağaçla uyumlu tutun.
 
 Aynı sürüm için `getkernel build --version X` tekrar çalıştırıldığında ve `data/packages/latest/` altında eşleşen paketler varsa (`build-info.json` kayıtlı), GetKernel **bunları algılar** ve sunar:
 
-- **[i]nstall** — bu `.deb` dosyalarını kur,
-- **[r]ebuild** — baştan tam derleme,
+- **[r]ebuild** — baştan tam derleme (varsayılan),
 - **[q]uit** — çık.
+
+Depodaki eski paketler **kurulum için sunulmaz**. Yalnızca yeni derleme tamamlandıktan sonra kurulum istemi, **o derlemenin** `.deb` dosyaları için gösterilir.
 
 Bu kontrol şu seçeneklerden biri verildiğinde **atlanır**: `--source-dir`, `--config`, `--fragment`, `--llvm`, `--localmodconfig`, `--force-rebuild`.
 
-**Etkileşimsiz varsayılan:** yeniden derler; şunu ayarlarsanız mevcut paketleri kurar:
-
-```bash
-GETKERNEL_EXISTING=install sudo -E getkernel build --version 6.12.8
-```
-
-Kabul edilen değerler: `install`, `i`, `1`, `yes` (büyük/küçük harf duyarsız).
+**Etkileşimsiz varsayılan:** depoda paket varsa yeniden derler.
 
 **Önbelleği yok sayıp tam derleme:**
 
@@ -352,14 +356,14 @@ Salt okunur komutlar yükseltme gerektirmez. Derleme/kurulum yolları ve `apt`/`
 | Değişken | Etki |
 |----------|------|
 | `GETKERNEL_ASSUME_YES=1` | `--yes` ile aynı aile: derleme sonrası **kurulumu** otomatik onayla. |
-| `GETKERNEL_EXISTING=install` | Aynı sürüm için `.deb` varken etkileşimsiz oturumda **kur**, yeniden derleme. |
+| `GETKERNEL_ROOT` | Kurulum/veri kökünü geçersiz kıl (varsayılan: `install.sh` sonrası `/usr/local/getkernel`). |
 | `GETKERNEL_NO_ELEVATE=1` | sudo ile yeniden çalıştırmayı yapma (test / özel kurulum). |
 
 ## Bilinen sınırlamalar
 
 - `.git` olmayan tarball ağacında **`deb-pkg`** otomatik olarak **`bindeb-pkg`** ile değiştirilir (üst akım `make` kaynak paketleri için git istiyor).
 - **Çapraz derleme** desteklenmez; araç yerel araç zinciri varsayar.
-- `data/` altındaki disk yolları proje köküne göre çözülür; YAML’da `paths` veya uygun CLI bayraklarıyla ayarlayın.
+- `data/` altındaki disk yolları kurulum köküne göre çözülür (`install.sh` sonrası `/usr/local/getkernel`); YAML’da `paths` veya uygun CLI bayraklarıyla ayarlayın.
 
 ## Sorumluluk reddi ve kullanıcı sorumluluğu
 

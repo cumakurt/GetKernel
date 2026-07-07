@@ -11,8 +11,36 @@ from typing import Optional
 
 
 def project_root() -> Path:
-    """Directory containing GetKernel.py (repository root)."""
-    return Path(__file__).resolve().parent.parent
+    """
+    Directory containing GetKernel.py and runtime data paths (data/cache, data/builds, …).
+
+    When installed under /usr/local/getkernel (marker from install.sh), use that root for
+    all operations. Development checkouts outside the install tree keep their own root.
+    Override with GETKERNEL_ROOT for tests or custom layouts.
+    """
+    override = os.environ.get("GETKERNEL_ROOT", "").strip()
+    if override:
+        root = Path(override).resolve()
+        if (root / "GetKernel.py").is_file():
+            return root
+
+    dev_root = Path(__file__).resolve().parent.parent
+
+    from utils.constants import GETKERNEL_INSTALL_DIR, GETKERNEL_INSTALL_MARKER
+
+    install_root = GETKERNEL_INSTALL_DIR.resolve()
+    marker = install_root / GETKERNEL_INSTALL_MARKER
+    if marker.is_file() and (install_root / "GetKernel.py").is_file():
+        try:
+            dev_root.resolve().relative_to(install_root)
+            return install_root
+        except ValueError:
+            pass
+        if (dev_root / "GetKernel.py").is_file() and dev_root.resolve() != install_root:
+            return dev_root.resolve()
+        return install_root
+
+    return dev_root
 
 
 def generate_build_id() -> str:

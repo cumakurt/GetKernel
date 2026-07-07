@@ -1,10 +1,32 @@
-"""Compiler target resolution."""
+"""Compiler target resolution and build progress."""
 
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
-from modules.compiler import Compiler
+from modules.compiler import CompilationProgress, Compiler
+
+
+class TestCompilationProgress(unittest.TestCase):
+    def test_phase_compiling_on_cc(self) -> None:
+        p = CompilationProgress(Path("/tmp/linux"), started_at=time.time())
+        p.update("  CC      drivers/net/ethernet.o")
+        snap = p.snapshot()
+        self.assertEqual(snap.phase, "compiling")
+        self.assertIn("ethernet", snap.activity)
+
+    def test_phase_packaging(self) -> None:
+        p = CompilationProgress(Path("/tmp/linux"), started_at=time.time())
+        p.update("dpkg-deb: building package 'linux-image'")
+        snap = p.snapshot()
+        self.assertEqual(snap.phase, "packaging")
+
+    def test_final_snapshot_is_complete(self) -> None:
+        p = CompilationProgress(Path("/tmp/linux"), started_at=time.time())
+        snap = p.snapshot(final=True)
+        self.assertEqual(snap.percent, 100.0)
+        self.assertEqual(snap.phase, "finishing")
 
 
 class TestCompilerResolve(unittest.TestCase):

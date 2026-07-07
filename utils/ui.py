@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import sys
 import textwrap
+import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable, List, Mapping, Optional
+from typing import Any, Callable, Iterable, Iterator, List, Mapping, Optional, TYPE_CHECKING
 
 from rich import box
 from rich.console import Console, Group
+from rich.live import Live
 from rich.panel import Panel
 from rich.progress import BarColumn, DownloadColumn, Progress, TextColumn, TransferSpeedColumn
 from rich.prompt import Confirm, Prompt
@@ -17,6 +21,9 @@ from rich.tree import Tree
 
 from utils.constants import APP_VERSION, DEVELOPER_NAME
 from utils.module_groups import group_kernel_modules
+
+if TYPE_CHECKING:
+    from modules.compiler import BuildProgressSnapshot
 
 console = Console()
 
@@ -416,6 +423,111 @@ def progress_download() -> Progress:
         TransferSpeedColumn(),
         console=console,
     )
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+
+class BuildProgressDisplay:
+    """Live terminal panel for kernel compilation (make output stays in log file)."""
+
+    def __init__(self, log_path: Path, make_target: str) -> None:
+        self.log_path = log_path
+        self.make_target = make_target
+        self._snapshot: Optional["BuildProgressSnapshot"] = None
+        self._live: Optional[Live] = None
+        self._last_refresh = 0.0
+        self._finished = False
+
+    def _render(self) -> Panel:
+        snap = self._snapshot
+        if snap is None:
+            body = Text("Starting …", style="dim")
+        else:
+            pct = min(100.0, max(0.0, snap.percent))
+            bar_width = 36
+            filled = int(bar_width * pct / 100.0)
+            bar = f"[cyan]{'█' * filled}[/][dim]{'░' * (bar_width - filled)}[/]"
+            eta = "—"
+            if snap.eta_seconds is not None and not self._finished:
+                eta = _format_duration(snap.eta_seconds)
+
+            lines = Table.grid(padding=(0, 0))
+            lines.add_row(f"[bold cyan]{snap.phase_label}[/]")
+            lines.add_row(f"{bar} [bold]{pct:5.1f}%[/]")
+            lines.add_row(
+                Text.from_markup(
+                    f"[dim]Elapsed[/] {_format_duration(snap.elapsed_seconds)}"
+                    f"  [dim]·[/]  [dim]ETA[/] {eta}"
+                )
+            )
+            activity = snap.activity or "…"
+            if len(activity) > 76:
+                activity = activity[:73] + "…"
+            lines.add_row(Text(activity, style="italic dim"))
+            lines.add_row(
+                Text.from_markup(
+                    f"[dim]make {self.make_target}[/]  [dim]·[/]  "
+                    f"[dim]log[/] {self.log_path}"
+                )
+            )
+            body = lines
+
+        title = "[bold green]Build complete[/]" if self._finished else "[bold]Kernel build[/]"
+        border = "green" if self._finished else "cyan"
+        return Panel(body, title=title, border_style=border, box=box.ROUNDED, padding=(1, 2))
+
+    def update(self, snapshot: "BuildProgressSnapshot") -> None:
+        now = time.time()
+        if (
+            not self._finished
+            and self._snapshot is not None
+            and now - self._last_refresh < 0.12
+            and snapshot.percent < 99.0
+        ):
+            return
+        self._last_refresh = now
+        self._snapshot = snapshot
+        if snapshot.phase == "finishing" and snapshot.percent >= 100.0:
+            self._finished = True
+        if self._live is not None:
+            self._live.update(self._render(), refresh=True)
+
+    @contextmanager
+    def live(self) -> Iterator[Callable[["BuildProgressSnapshot"], None]]:
+        if not sys.stderr.isatty():
+            yield self._noop_update
+            return
+        console.print()
+        with Live(self._render(), console=console, refresh_per_second=8, transient=False) as live:
+            self._live = live
+            try:
+                yield self.update
+            finally:
+                self._live = None
+                if self._snapshot is not None:
+                    self._finished = True
+                    live.update(self._render(), refresh=True)
+        console.print()
+
+    @staticmethod
+    def _noop_update(_snapshot: "BuildProgressSnapshot") -> None:
+        return
+
+
+@contextmanager
+def build_progress_display(log_path: Path, make_target: str) -> Iterator[Callable[["BuildProgressSnapshot"], None]]:
+    display = BuildProgressDisplay(log_path, make_target)
+    with display.live() as callback:
+        yield callback
 
 
 def print_error_block(title: str, message: str, hints: Optional[List[str]] = None) -> None:

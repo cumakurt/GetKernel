@@ -16,7 +16,7 @@ Python tool for Debian-based systems to list kernels from kernel.org, optionally
 
 ## Install
 
-Quick install (creates `.venv`, installs from `pyproject.toml`):
+Quick install (copies the project to `/usr/local/getkernel`, creates a venv there, installs from `pyproject.toml`):
 
 ```bash
 cd GetKernel
@@ -24,14 +24,15 @@ chmod +x install.sh   # once, if needed
 sudo ./install.sh     # optional: sudo ./install.sh --dev  (pytest, etc.)
 ```
 
-**Root is required.** If you run `./install.sh` without `sudo`, the script re-runs itself with `sudo` and asks for your password. The virtualenv under `.venv` is then owned by your user when you used `sudo` (so you can edit and run without root).
+**Root is required.** If you run `./install.sh` without `sudo`, the script re-runs itself with `sudo` and asks for your password.
 
-The installer **adds `getkernel` to your PATH** so it works in new terminals and after reboot:
+If older GetKernel files are found (previous install dir, symlinks, or shell PATH blocks), the installer lists them and asks for confirmation before removal. Use `--yes` to skip that prompt.
 
-- After `sudo ./install.sh`: **`~/.local/bin/getkernel`** for `SUDO_USER`, **and** **`/usr/local/bin/getkernel`** so **root shells** (and any user with `/usr/local/bin` on `PATH`) can run `getkernel` immediately.
-- `sudo` from a root login (no `SUDO_USER`): symlink `/usr/local/bin/getkernel` only.
+The installer places files under **`/usr/local/getkernel`** and adds **`/usr/local/bin/getkernel`** to your PATH (available to all users with `/usr/local/bin` on `PATH`).
 
-Open a **new terminal** or run `source ~/.profile` once so the current shell picks up `PATH`. To skip global integration: `sudo ./install.sh --no-symlink` (then use `source .venv/bin/activate` or `.venv/bin/getkernel`). To bypass the sudo requirement for special setups only: `GETKERNEL_ALLOW_USER_INSTALL=1 ./install.sh`.
+After installation, kernel downloads, build trees, logs, and package output are stored under `/usr/local/getkernel/data/` (cache, builds, logs, packages).
+
+To skip the global symlink: `sudo ./install.sh --no-symlink` (then use `source /usr/local/getkernel/.venv/bin/activate` or `/usr/local/getkernel/.venv/bin/getkernel`).
 
 Manual install:
 
@@ -253,9 +254,17 @@ sudo getkernel build --version 6.12.8 --llvm
 
 Or set `build.use_llvm: true` in `config/user_config.yaml`.
 
-### 13. Quiet terminal during compile
+### 13. Build progress on the terminal
 
-Suppress `make` output on the terminal; the full log is still written to `data/logs/build-<id>.log`:
+By default, GetKernel shows a **live progress panel** (current phase, percent bar, ETA, last activity). Full `make` output is always written to `data/logs/build-<id>.log`.
+
+Stream all `make` lines to the terminal:
+
+```bash
+sudo getkernel build --version 6.12.8 --verbose
+```
+
+Minimal output (no progress panel; log file only):
 
 ```bash
 sudo getkernel build --version 6.12.8 --quiet
@@ -283,19 +292,14 @@ Use the version string that matches that tree so packaging metadata stays consis
 
 If you run `getkernel build --version X` again and matching packages are already under `data/packages/latest/` (from `build-info.json`), GetKernel **detects** them and offers:
 
-- **[i]nstall** — install those `.deb` files,
-- **[r]ebuild** — full compile again,
+- **[r]ebuild** — full compile again (default),
 - **[q]uit** — exit.
+
+Stored depot packages are **not** offered for installation. After a fresh build, the install prompt applies only to the **newly built** `.deb` files.
 
 This reuse check is **skipped** when you pass `--source-dir`, `--config`, `--fragment`, `--llvm`, `--localmodconfig`, or `--force-rebuild`.
 
-**Non-interactive default:** rebuilds unless you set:
-
-```bash
-GETKERNEL_EXISTING=install sudo -E getkernel build --version 6.12.8
-```
-
-Accepted values include `install`, `i`, `1`, `yes` (case-insensitive).
+**Non-interactive default:** rebuilds when stored packages exist.
 
 **Force a full rebuild** regardless of cached packages:
 
@@ -352,14 +356,14 @@ Notable keys: `paths.*`, `kernel.localversion`, `kernel.reuse_downloads`, `build
 | Variable | Effect |
 |----------|--------|
 | `GETKERNEL_ASSUME_YES=1` | Same family as `--yes`: auto-confirm **install** after build. |
-| `GETKERNEL_EXISTING=install` | When re-running a version with existing `.deb`, non-interactive: **install** instead of rebuild. |
+| `GETKERNEL_ROOT` | Override install/data root (default: `/usr/local/getkernel` when installed via `install.sh`). |
 | `GETKERNEL_NO_ELEVATE=1` | Do not re-exec with sudo (testing / special setups only). |
 
 ## Known limitations
 
 - **`deb-pkg`** on a tarball tree without `.git` is automatically switched to **`bindeb-pkg`** (upstream `make` requires a git checkout for source packages).
 - **Cross-compilation** is not handled; the tool assumes a native toolchain on the build host.
-- **Disk paths** under `data/` are resolved from the project root; adjust `paths` in YAML or use CLI flags where available.
+- **Disk paths** under `data/` are resolved from the install root (`/usr/local/getkernel` after `install.sh`); adjust `paths` in YAML or use CLI flags where available.
 
 ## Disclaimer and user responsibility
 
