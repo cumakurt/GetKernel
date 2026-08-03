@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List
 
-from utils.helpers import run_cmd
+from utils.helpers import run_cmd, which
 
 
 def _secure_boot_enabled() -> bool:
@@ -41,6 +41,21 @@ def _loaded_gpu_drivers() -> List[str]:
     return hits
 
 
+def _vmware_host_modules_present() -> bool:
+    """Detect VMware's non-DKMS vmmon/vmnet build path as well as loaded modules."""
+    if which("vmware-modconfig"):
+        return True
+    return any(
+        path.exists()
+        for path in (
+            Path("/usr/lib/vmware/modules/source/vmmon.tar"),
+            Path("/usr/lib/vmware/modules/source/vmnet.tar"),
+            Path("/sys/module/vmmon"),
+            Path("/sys/module/vmnet"),
+        )
+    )
+
+
 def collect_build_warnings(kernel_version: str) -> List[str]:
     """Return human-readable warnings before starting a long build."""
     warnings: List[str] = []
@@ -57,6 +72,12 @@ def collect_build_warnings(kernel_version: str) -> List[str]:
             + ", ".join(dkms[:8])
             + (" …" if len(dkms) > 8 else "")
             + ". Post-install may run module rebuilds; failures can leave dpkg in a bad state."
+        )
+    if _vmware_host_modules_present():
+        warnings.append(
+            "VMware vmmon/vmnet host modules detected. Matching linux-headers will be "
+            "required after installation; vendor source compatibility with the selected "
+            "kernel version must still be checked."
         )
     gpus = _loaded_gpu_drivers()
     if "nvidia" in gpus and ("rc" in ver or ver.startswith("6.") or ver.startswith("7.")):

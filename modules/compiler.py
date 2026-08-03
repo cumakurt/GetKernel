@@ -15,6 +15,7 @@ from typing import Callable, Dict, List, Mapping, Optional
 from utils.constants import COMPILATION_ERROR_HINTS
 from utils.exceptions import CompilationError
 from utils.helpers import project_root, run_cmd
+from utils.validator import validate_kernel_release, validate_localversion
 
 BUILD_TIMEOUT_SEC = 86400
 
@@ -161,6 +162,7 @@ class Compiler:
         config_file: Optional[str] = None,
         *,
         resume: bool = False,
+        local_version: str = "",
     ) -> bool:
         if config_file:
             src = Path(config_file)
@@ -171,6 +173,7 @@ class Compiler:
             return True
         env = os.environ.copy()
         env.setdefault("TERM", "xterm")
+        env["LOCALVERSION"] = local_version
         for target in ("olddefconfig", "prepare"):
             cp = subprocess.run(
                 ["make", target],
@@ -183,6 +186,26 @@ class Compiler:
             if cp.returncode != 0:
                 raise CompilationError(f"make {target} failed:\n{cp.stderr[-4000:]}")
         return True
+
+    def get_kernel_release(self, local_version: str = "") -> str:
+        """Return the exact Kbuild release used for package/module paths."""
+        if not validate_localversion(local_version):
+            raise CompilationError(
+                "Invalid LOCALVERSION; use an empty value or a suffix such as '-custom'."
+            )
+        env = os.environ.copy()
+        env["LOCALVERSION"] = local_version
+        cp = run_cmd(
+            ["make", "-s", "kernelrelease"],
+            cwd=self.source_dir,
+            env=env,
+            timeout=300,
+        )
+        release = cp.stdout.strip().splitlines()[-1] if cp.stdout.strip() else ""
+        if cp.returncode != 0 or not validate_kernel_release(release):
+            detail = (cp.stderr or cp.stdout or "unknown error")[-2000:]
+            raise CompilationError(f"Cannot determine a safe kernel release: {detail}")
+        return release
 
     def has_partial_build(self) -> bool:
         if not (self.source_dir / ".config").is_file():
@@ -212,7 +235,7 @@ class Compiler:
         self,
         target: str = "bindeb-pkg",
         jobs: Optional[int] = None,
-        local_version: str = "-getkernel",
+        local_version: str = "",
         verbose: bool = False,
         progress_callback: Optional[Callable[[BuildProgressSnapshot], None]] = None,
         log_path: Optional[Path] = None,
@@ -227,21 +250,37 @@ class Compiler:
                 "bindeb-pkg for this extracted source (no .git).",
                 file=sys.stderr,
             )
-        j = jobs if jobs else self.cpu_count
+        if not validate_localversion(local_version):
+            raise CompilationError(
+                "Invalid LOCALVERSION; use an empty value or a suffix such as '-custom'."
+            )
+        if jobs is None:
+            j = self.cpu_count
+        else:
+            if isinstance(jobs, bool):
+                raise CompilationError("build.jobs must be a positive integer or null")
+            try:
+                j = int(jobs)
+            except (TypeError, ValueError) as exc:
+                raise CompilationError("build.jobs must be a positive integer or null") from exc
+            if j < 1:
+                raise CompilationError("build.jobs must be a positive integer or null")
         self.compilation_start_time = time.time()
         self.build_id = build_id
         self._progress_helper = CompilationProgress(
             self.source_dir, started_at=self.compilation_start_time
         )
         env = os.environ.copy()
-        env["LOCALVERSION"] = local_version
         env.setdefault("KBUILD_BUILD_USER", "getkernel")
         env.setdefault("KBUILD_BUILD_HOST", "localhost")
         env.update(self._ccache_env)
-        if use_llvm:
-            env["LLVM"] = "1"
         if extra_env:
             env.update(dict(extra_env))
+        # Do not allow the caller's shell or extra_env to silently change the
+        # package release after it has been calculated and recorded.
+        env["LOCALVERSION"] = local_version
+        if use_llvm:
+            env["LLVM"] = "1"
 
         log_file = log_path or (project_root() / "data" / "logs" / "build.log")
         log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -302,7 +341,7 @@ class Compiler:
         elapsed = time.time() - (self.compilation_start_time or time.time())
         self.estimated_duration = elapsed
 
-        if self._progress_helper and progress_callback:
+        if rc == 0 and self._progress_helper and progress_callback:
             progress_callback(self._progress_helper.snapshot(final=True))
 
         summary = (

@@ -14,19 +14,55 @@ from utils.validator import path_is_within, validate_build_id
 ARCHIVE_DIRNAME = "archive"
 
 
+def _read_build_info(directory: Path) -> Dict[str, Any]:
+    info_path = directory / BUILD_INFO_FILENAME
+    if not info_path.is_file():
+        return {}
+    try:
+        data = json.loads(info_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _package_paths(directory: Path) -> List[Path]:
+    """Prefer the manifest-backed build set and reject names escaping the depot."""
+    info = _read_build_info(directory)
+    names = info.get("deb_names")
+    if isinstance(names, list) and names:
+        packages: List[Path] = []
+        for name in names:
+            if not isinstance(name, str) or Path(name).name != name or not name.endswith(".deb"):
+                continue
+            path = directory / name
+            if path.is_file():
+                packages.append(path)
+        return sorted(packages)
+    return sorted(directory.glob("linux-*.deb"))
+
+
+def read_build_info(
+    packages_dir: Path,
+    *,
+    build_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Read metadata for the exact latest/archive package set being operated on."""
+    if build_id:
+        if not validate_build_id(build_id):
+            return {}
+        directory = packages_dir / ARCHIVE_DIRNAME / f"build-{build_id}"
+    else:
+        directory = packages_dir / "latest"
+    return _read_build_info(directory)
+
+
 def list_latest_packages(packages_dir: Path) -> List[Dict[str, Any]]:
     latest = packages_dir / "latest"
     if not latest.is_dir():
         return []
     rows: List[Dict[str, Any]] = []
-    info: Dict[str, Any] = {}
-    info_path = latest / BUILD_INFO_FILENAME
-    if info_path.is_file():
-        try:
-            info = json.loads(info_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, json.JSONDecodeError):
-            info = {}
-    for deb in sorted(latest.glob("linux-*.deb")):
+    info = _read_build_info(latest)
+    for deb in _package_paths(latest):
         rows.append(
             {
                 "name": deb.name,
@@ -48,14 +84,8 @@ def list_archived_builds(packages_dir: Path) -> List[Dict[str, Any]]:
     for d in sorted(archive.iterdir(), reverse=True):
         if not d.is_dir() or not d.name.startswith("build-"):
             continue
-        info: Dict[str, Any] = {}
-        info_path = d / BUILD_INFO_FILENAME
-        if info_path.is_file():
-            try:
-                info = json.loads(info_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError, json.JSONDecodeError):
-                info = {}
-        deb_count = len(list(d.glob("linux-*.deb")))
+        info = _read_build_info(d)
+        deb_count = len(_package_paths(d))
         out.append(
             {
                 "build_id": d.name.replace("build-", "", 1),
@@ -80,11 +110,11 @@ def resolve_package_paths(
         target = (archive_root / f"build-{build_id}").resolve()
         if not target.is_dir() or not path_is_within(target, archive_root):
             return []
-        return sorted(target.glob("linux-*.deb"))
+        return _package_paths(target)
     latest = packages_dir / "latest"
     if not latest.is_dir():
         return []
-    return sorted(latest.glob("linux-*.deb"))
+    return _package_paths(latest)
 
 
 def archive_latest_to_build_id(packages_dir: Path, build_id: str) -> Optional[Path]:
@@ -93,7 +123,7 @@ def archive_latest_to_build_id(packages_dir: Path, build_id: str) -> Optional[Pa
     latest = packages_dir / "latest"
     if not latest.is_dir():
         return None
-    debs = list(latest.glob("linux-*.deb"))
+    debs = _package_paths(latest)
     if not debs:
         return None
     dest = packages_dir / ARCHIVE_DIRNAME / f"build-{build_id}"

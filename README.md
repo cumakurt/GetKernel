@@ -97,10 +97,10 @@ pip install -e ".[dev]"
 | `check` | OS, disk, RAM, toolchain validation (`--json`) |
 | `status` | Running kernel, GRUB, depot, last build log (`--json`) |
 | `deps` | Missing build packages (`--install` to apt install) |
-| `install` | Install `.deb` packages from depot (`--build-id`) |
+| `install` | Install runtime `.deb` packages from depot (`--build-id`, optional `--kernel-version`) |
 | `packages list` | List latest and archived builds (`--json`) |
 | `backups` | Boot file backups before install (`--json`) |
-| `rollback` | Restore a backup by id |
+| `rollback` | Restore a backup by id (`backup-YYYYMMDD-HHMMSS`) |
 | `cleanup` | Old kernel packages and/or build artifacts |
 | `uninstall` | Remove GetKernel from `/usr/local/getkernel` |
 | `about` | Project and author info |
@@ -200,11 +200,16 @@ sudo getkernel prepare --version 6.12.8 --fragment cfg1 --localmodconfig
 
 ### `install` — install from package depot
 
+Installs **runtime packages only** (`linux-image-*`, `linux-headers-*`, `linux-modules-*`). `linux-libc-dev` and debug packages stay archived under `data/packages/`.
+
+When `--kernel-version` is omitted, GetKernel reads `kernel_release` from `build-info.json` (or reconstructs it from `requested_version` + `localversion`).
+
 ```bash
 sudo getkernel install
 sudo getkernel --yes install
 sudo getkernel install --build-id a1b2c3d4e5f6
-sudo getkernel install --kernel-version 6.12.8-getkernel
+sudo getkernel install --kernel-version 6.12.8
+sudo getkernel install --build-id a1b2c3d4e5f6 --kernel-version 6.12.8-custom
 ```
 
 ### `packages list` — depot contents
@@ -248,7 +253,9 @@ sudo getkernel cleanup --old-kernels --build-artifacts
 
 If matching `.deb` files already exist under `data/packages/latest/`, `build` offers **rebuild** or **quit**. Install stored packages with **`getkernel install`** (or `install --build-id <id>` for archives under `data/packages/archive/`). The post-build install prompt appears only after a **fresh** build. Skip the rebuild check with `--force-rebuild` or when using `--config`, `--fragment`, `--profile`, `--menuconfig`, `--resume-build`, `--llvm`, `--localmodconfig`, or `--source-dir`.
 
-After install, GetKernel verifies `/boot/vmlinuz-*` and `/lib/modules/*` when a kernel version hint is available.
+Each build writes `data/packages/latest/build-info.json` with `requested_version`, `localversion`, and the exact **`kernel_release`** from Kbuild. Package discovery and verification use that release so stale sibling `.deb` files are not picked up.
+
+After install, GetKernel verifies `/boot/vmlinuz-*`, `/lib/modules/<release>/`, and `/lib/modules/<release>/build` (headers symlink) when a kernel release hint is available.
 
 ## Privileges
 
@@ -280,15 +287,23 @@ flowchart LR
 
 | Module | Role |
 |--------|------|
-| **KernelFetcher** | kernel.org metadata; download/resume; SHA256; optional GPG; CDN mirror fallback |
-| **ConfigManager** | `.config` from running kernel or file; fragments; profiles; `menuconfig` |
-| **Compiler** | `make bindeb-pkg` (default); live progress; resume partial builds |
-| **PackageBuilder** | Collect `linux-*.deb` → `latest/`; archive per build id |
-| **PackageDepot** | List and resolve packages from `latest/` and `archive/` |
-| **Installer** | `dpkg`, `apt-get install -f`, initramfs, GRUB; backup/rollback; verify |
+| **KernelFetcher** | kernel.org metadata; download/resume; SHA256; optional GPG; CDN mirror fallback; safe tarball extraction |
+| **ConfigManager** | `.config` from running kernel or file; fragments; profiles; `menuconfig`; module-friendly Kconfig prep |
+| **Compiler** | `make bindeb-pkg` (default); live progress; `kernelrelease` detection; resume or clean partial builds |
+| **PackageBuilder** | Collect release-scoped `linux-*.deb` → `latest/`; verify image + headers; archive per build id |
+| **PackageDepot** | List and resolve packages from `latest/` and `archive/` (validated build ids) |
+| **Installer** | Runtime package selection; `dpkg` + `apt-get install -f`; initramfs; GRUB; backup/rollback; verify |
 | **SystemAdvisor** | DKMS, GPU driver, and Secure Boot warnings before build/install |
 
 Tarball trees without `.git` use **`bindeb-pkg`** automatically (`deb-pkg` needs a git checkout).
+
+### Kernel release & module-friendly builds
+
+- **`kernel.localversion`** defaults to **empty**, so the installed release matches the selected upstream version (e.g. `6.12.8`). Set e.g. `"-custom"` only when you want an explicit suffix.
+- Before compile, GetKernel normalises inherited distro Kconfig (disables `LOCALVERSION_AUTO`, keeps `CONFIG_MODULES`, clears missing distro certificate paths).
+- Kbuild **`kernelrelease`** is recorded and checked against the requested version before packaging.
+- A fresh build (without `--resume-build`) runs `make clean` when partial artefacts exist in the source tree.
+- Builds time out after **24 hours**; full output is logged under `data/logs/build-<id>.log`.
 
 ## Configuration
 
@@ -298,7 +313,8 @@ Example override:
 
 ```yaml
 kernel:
-  localversion: "-custom"
+  # Empty by default. Set "-custom" only when you explicitly want a suffix.
+  localversion: ""
   reuse_downloads: true
   verify_checksum: true
   verify_signature: false
@@ -319,12 +335,13 @@ dependencies:
 | Key | Purpose |
 |-----|---------|
 | `paths.*` | cache, logs, builds, packages directories |
-| `kernel.localversion` | suffix appended to kernel release |
+| `kernel.localversion` | optional suffix appended to the kernel release (default: empty) |
 | `kernel.reuse_downloads` | skip re-download when tarball/tree exists |
 | `kernel.verify_checksum` / `kernel.verify_signature` | tarball SHA256 and optional GPG (`gpg` required) |
 | `kernel.include_beta` / `kernel.include_rc` | filter kernel.org version list |
-| `build.jobs` | parallel make jobs (`null` = CPU count) |
+| `build.jobs` | parallel make jobs (`null` = CPU count; must be a positive integer when set) |
 | `build.target` | `bindeb-pkg` or `deb-pkg` |
+| `build.use_ccache` | enable ccache via `/usr/lib/ccache` when available (default: true) |
 | `build.use_llvm` / `build.localmodconfig` | LLVM build; module trimming |
 | `build.config_fragments` | Kconfig fragment paths |
 | `build.profiles.*` | named profiles for `--profile` (`config/profiles/`) |
@@ -347,8 +364,8 @@ GETKERNEL_NO_ELEVATE=1 getkernel check    # testing only
 ## Limitations & warnings
 
 - No cross-compilation support; native toolchain only.
-- Custom kernels can break **DKMS**, **NVIDIA**, and other out-of-tree drivers — especially on **RC/mainline** kernels. GetKernel warns before build/install when DKMS or proprietary drivers are detected.
-- Replacing **`linux-libc-dev`** may affect userland builds on the same machine.
+- GetKernel keeps module support/exported symbols enabled, requires a matching `linux-headers` package, and verifies `/lib/modules/<release>/build`. This avoids tool-created VMware/DKMS build failures; vendor sources can still be incompatible with a new **RC/mainline** kernel API.
+- Generated **`linux-libc-dev`** and debug packages are archived but are not installed automatically, avoiding an unrelated replacement of distribution user-space headers.
 - **Secure Boot** may require extra steps for unsigned modules.
 - **Back up** and know how to boot a previous kernel before installing. Use `getkernel backups` and `rollback` for boot-file recovery.
 

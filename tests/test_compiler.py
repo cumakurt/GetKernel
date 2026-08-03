@@ -3,9 +3,12 @@
 import tempfile
 import time
 import unittest
+import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 from modules.compiler import CompilationProgress, Compiler
+from utils.exceptions import CompilationError
 
 
 class TestCompilationProgress(unittest.TestCase):
@@ -56,6 +59,21 @@ class TestCompilerResolve(unittest.TestCase):
             h = c.handle_compilation_error(out)
             self.assertEqual(h["error_type"], "build")
             self.assertIn("libssl-dev", h["solution"])
+
+    def test_kernel_release_uses_explicit_empty_localversion(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            c = Compiler(td)
+            with patch("modules.compiler.run_cmd") as command:
+                command.return_value = subprocess.CompletedProcess(
+                    ["make"], 0, stdout="6.12.8\n", stderr=""
+                )
+                self.assertEqual(c.get_kernel_release(""), "6.12.8")
+            self.assertEqual(command.call_args.kwargs["env"]["LOCALVERSION"], "")
+
+    def test_compile_rejects_invalid_jobs_before_starting_make(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(CompilationError):
+                Compiler(td).compile_kernel(jobs=0)
 
 
 if __name__ == "__main__":

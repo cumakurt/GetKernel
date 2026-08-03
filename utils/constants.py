@@ -41,7 +41,6 @@ REQUIRED_COMMANDS = (
     "xz",
 )
 
-# Prefer kernel-wedge (per plan section 2); fallback name handled in dependency_manager
 REQUIRED_PACKAGES = [
     "build-essential",
     "gcc",
@@ -62,7 +61,6 @@ REQUIRED_PACKAGES = [
     "dpkg-dev",
     "debhelper",
     "fakeroot",
-    "kernel-wedge",
 ]
 
 OPTIONAL_PACKAGES = [

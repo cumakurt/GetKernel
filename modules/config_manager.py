@@ -11,16 +11,17 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from utils.exceptions import ConfigError
 from utils.helpers import run_cmd
+from utils.validator import validate_localversion
 
 
 class ConfigManager:
     """Manage kernel Kconfig for a source tree."""
 
-    CRITICAL_OPTIONS = [
-        "CONFIG_MODULES=y",
-        "CONFIG_MODULE_UNLOAD=y",
-        "CONFIG_PRINTK=y",
-    ]
+    CRITICAL_OPTIONS = {
+        "CONFIG_MODULES": "y",
+        "CONFIG_MODULE_UNLOAD": "y",
+        "CONFIG_PRINTK": "y",
+    }
 
     def __init__(self, kernel_source_dir: str) -> None:
         self.kernel_source_dir = Path(kernel_source_dir)
@@ -86,7 +87,8 @@ class ConfigManager:
             timeout=3600,
         )
         if cp.returncode != 0:
-            raise ConfigError(f"make {target} failed: {cp.stderr[-2000:]}")
+            output = (cp.stdout or "") + (cp.stderr or "")
+            raise ConfigError(f"make {target} failed: {output[-2000:]}")
         return True
 
     def merge_config_fragments(self, fragment_paths: List[Path]) -> None:
@@ -157,15 +159,88 @@ class ConfigManager:
         """Merge a named build profile fragment into the current .config."""
         self.merge_config_fragments([profile_path])
 
+    @staticmethod
+    def _config_value(text: str, key: str) -> Optional[str]:
+        set_match = re.search(rf"^{re.escape(key)}=(.*)$", text, re.MULTILINE)
+        if set_match:
+            return set_match.group(1).strip()
+        if re.search(rf"^# {re.escape(key)} is not set$", text, re.MULTILINE):
+            return "n"
+        return None
+
+    @staticmethod
+    def _replace_config_value(text: str, key: str, value: str) -> str:
+        """Set a Kconfig value without leaving duplicate assignments behind."""
+        new_line = f"# {key} is not set" if value == "n" else f"{key}={value}"
+        pattern = re.compile(
+            rf"^(?:{re.escape(key)}=.*|# {re.escape(key)} is not set)$",
+            re.MULTILINE,
+        )
+        if pattern.search(text):
+            return pattern.sub(new_line, text, count=1)
+        separator = "" if not text or text.endswith("\n") else "\n"
+        return f"{text}{separator}{new_line}\n"
+
+    def prepare_external_module_config(self, localversion: str = "") -> List[str]:
+        """Keep the release deterministic and preserve out-of-tree module support.
+
+        Kbuild adds the environment ``LOCALVERSION`` separately, so inherited
+        distro suffixes and SCM suffixes are neutralised here.  Module support is
+        kept enabled and unused exported symbols are not trimmed; both are needed
+        by VMware, DKMS and similar modules built after the kernel is installed.
+
+        Returns the names of missing distro certificate files that were cleared.
+        """
+        if not self.config_file.is_file():
+            raise ConfigError(".config missing")
+        if not validate_localversion(localversion):
+            raise ConfigError(
+                "kernel.localversion must be empty or a path-safe suffix such as '-custom'"
+            )
+
+        text = self.config_file.read_text(encoding="utf-8", errors="replace")
+        changes = {
+            "CONFIG_LOCALVERSION": '""',
+            "CONFIG_LOCALVERSION_AUTO": "n",
+            "CONFIG_MODULES": "y",
+            "CONFIG_MODULE_UNLOAD": "y",
+            "CONFIG_TRIM_UNUSED_KSYMS": "n",
+        }
+        for key, value in changes.items():
+            text = self._replace_config_value(text, key, value)
+
+        cleared_keys: List[str] = []
+        # Distribution configs often refer to certificate files that are not in
+        # an upstream kernel.org tarball. Leaving those paths intact makes the
+        # otherwise valid build fail before packages (and headers) are produced.
+        for key in ("CONFIG_SYSTEM_TRUSTED_KEYS", "CONFIG_SYSTEM_REVOCATION_KEYS"):
+            raw = self._config_value(text, key)
+            if not raw or raw == "n":
+                continue
+            configured_path = raw.strip('"')
+            if configured_path and not (self.kernel_source_dir / configured_path).is_file():
+                text = self._replace_config_value(text, key, '""')
+                cleared_keys.append(key)
+
+        self.config_file.write_text(text, encoding="utf-8")
+        self.run_oldconfig(interactive=False)
+        return cleared_keys
+
     def validate_config(self) -> Tuple[bool, List[str]]:
         errors: List[str] = []
         if not self.config_file.is_file():
             return False, ["missing .config"]
         text = self.config_file.read_text(encoding="utf-8", errors="replace")
-        for opt in self.CRITICAL_OPTIONS:
-            key = opt.split("=")[0]
-            if key not in text:
+        for key, expected in self.CRITICAL_OPTIONS.items():
+            actual = self._config_value(text, key)
+            if actual is None:
                 errors.append(f"missing {key}")
+            elif actual != expected:
+                errors.append(f"{key} must be {expected} (found {actual})")
+        if self._config_value(text, "CONFIG_TRIM_UNUSED_KSYMS") == "y":
+            errors.append(
+                "CONFIG_TRIM_UNUSED_KSYMS must be disabled for out-of-tree modules"
+            )
         return len(errors) == 0, errors
 
     def enable_module(self, module_name: str) -> bool:

@@ -18,6 +18,7 @@ from utils.validator import (
     path_is_within,
     validate_backup_id,
     validate_boot_backup_filename,
+    validate_kernel_release,
 )
 
 from modules.grub_manager import GrubManager
@@ -56,6 +57,27 @@ class Installer:
             default=default_confirm,
         )
 
+    @staticmethod
+    def select_runtime_packages(package_list: List[Path]) -> List[Path]:
+        """Select image/module/header packages needed to boot and build modules.
+
+        ``bindeb-pkg`` also emits linux-libc-dev and sometimes a very large debug
+        package. Installing those is unrelated to booting the new kernel and can
+        replace distribution user-space headers, so they remain archived but are
+        not installed automatically.
+        """
+        selected: List[Path] = []
+        for deb in package_list:
+            cp = run_cmd(["dpkg-deb", "-f", str(deb), "Package"])
+            if cp.returncode != 0:
+                continue
+            package = cp.stdout.strip().splitlines()[0] if cp.stdout.strip() else ""
+            if package.endswith("-dbg") or package == "linux-libc-dev":
+                continue
+            if package.startswith(("linux-image-", "linux-headers-", "linux-modules-")):
+                selected.append(deb)
+        return selected
+
     def install_packages(
         self,
         package_list: List[Path],
@@ -71,6 +93,8 @@ class Installer:
             ok, msg = check_file_safety(deb)
             if not ok:
                 raise InstallationError(f"Unsafe package file {deb}: {msg}")
+        if kernel_version_hint and not validate_kernel_release(kernel_version_hint):
+            raise InstallationError(f"Invalid kernel release hint: {kernel_version_hint!r}")
 
         pre = sudo_prefix()
         files = [str(p) for p in package_list]
@@ -82,7 +106,7 @@ class Installer:
         )
         log = (cp.stdout or "") + (cp.stderr or "")
         ok = cp.returncode == 0
-        if fix_dependencies:
+        if not ok and fix_dependencies:
             env = os.environ.copy()
             env["DEBIAN_FRONTEND"] = "noninteractive"
             fix = subprocess.run(
@@ -95,13 +119,24 @@ class Installer:
             log += (fix.stdout or "") + (fix.stderr or "")
             ok = fix.returncode == 0
 
-        if kernel_version_hint:
-            subprocess.run(
+        if ok and kernel_version_hint:
+            initramfs = subprocess.run(
                 pre + ["update-initramfs", "-u", "-k", kernel_version_hint],
                 capture_output=True,
                 text=True,
+                timeout=1800,
             )
-        subprocess.run(pre + ["update-grub"], capture_output=True, text=True)
+            log += (initramfs.stdout or "") + (initramfs.stderr or "")
+            ok = initramfs.returncode == 0
+        if ok:
+            grub = subprocess.run(
+                pre + ["update-grub"],
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+            log += (grub.stdout or "") + (grub.stderr or "")
+            ok = grub.returncode == 0
         return ok, log
 
     def create_backup(self, kernel_version: Optional[str] = None) -> Optional[str]:
@@ -188,11 +223,22 @@ class Installer:
 
     def verify_installation(self, kernel_version: str) -> Tuple[bool, List[str]]:
         issues: List[str] = []
+        if not validate_kernel_release(kernel_version):
+            return False, [f"invalid kernel release: {kernel_version!r}"]
         if not (Path("/boot") / f"vmlinuz-{kernel_version}").is_file():
             issues.append(f"missing /boot/vmlinuz-{kernel_version}")
         moddir = Path("/lib/modules") / kernel_version
         if not moddir.is_dir():
             issues.append(f"missing {moddir}")
+        else:
+            build_dir = moddir / "build"
+            if not build_dir.exists():
+                issues.append(
+                    f"missing {build_dir} (install matching linux-headers; "
+                    "VMware/DKMS modules cannot be built without it)"
+                )
+            elif not (build_dir / "Makefile").is_file():
+                issues.append(f"incomplete kernel headers under {build_dir}")
         return len(issues) == 0, issues
 
     def set_default_kernel(self, kernel_version: str) -> bool:

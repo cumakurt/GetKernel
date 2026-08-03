@@ -10,11 +10,13 @@ class TestSystemAdvisor(unittest.TestCase):
     @patch("modules.system_advisor._dkms_modules", return_value=["nvidia", "zfs"])
     @patch("modules.system_advisor._loaded_gpu_drivers", return_value=["nvidia"])
     @patch("modules.system_advisor._secure_boot_enabled", return_value=True)
+    @patch("modules.system_advisor._vmware_host_modules_present", return_value=True)
     def test_collect_build_warnings(self, *_mocks) -> None:
         warnings = collect_build_warnings("6.13-rc1")
         self.assertTrue(any("DKMS" in w for w in warnings))
         self.assertTrue(any("Secure Boot" in w for w in warnings))
         self.assertTrue(any("Release candidate" in w for w in warnings))
+        self.assertTrue(any("VMware" in w for w in warnings))
 
     @patch("modules.system_advisor._secure_boot_enabled", return_value=False)
     def test_status_secure_boot(self, _mock: object) -> None:

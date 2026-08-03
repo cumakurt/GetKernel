@@ -18,10 +18,6 @@ def _dpkg_installed(name: str) -> bool:
     return "install ok installed" in cp.stdout
 
 
-def _has_packaging_tool() -> bool:
-    return _dpkg_installed("kernel-wedge") or _dpkg_installed("kernel-package")
-
-
 class DependencyManager:
     """Install build dependencies via apt."""
 
@@ -31,9 +27,6 @@ class DependencyManager:
     def check_dependencies(self) -> Dict[str, bool]:
         result: Dict[str, bool] = {}
         for pkg in REQUIRED_PACKAGES:
-            if pkg == "kernel-wedge":
-                result["kernel-wedge"] = _has_packaging_tool()
-                continue
             result[pkg] = _dpkg_installed(pkg)
         for pkg in OPTIONAL_PACKAGES:
             result[pkg] = _dpkg_installed(pkg)
@@ -42,10 +35,6 @@ class DependencyManager:
     def get_missing_packages(self, include_optional: bool = False) -> List[str]:
         missing: List[str] = []
         for pkg in REQUIRED_PACKAGES:
-            if pkg == "kernel-wedge":
-                if not _has_packaging_tool():
-                    missing.append("kernel-wedge")
-                continue
             if not _dpkg_installed(pkg):
                 missing.append(pkg)
         if include_optional:
@@ -89,10 +78,7 @@ class DependencyManager:
             return False, packages
         failed: List[str] = []
         for p in packages:
-            if p == "kernel-wedge":
-                if not _has_packaging_tool():
-                    failed.append("kernel-wedge")
-            elif not _dpkg_installed(p):
+            if not _dpkg_installed(p):
                 failed.append(p)
         return len(failed) == 0, failed
 
@@ -136,6 +122,4 @@ class DependencyManager:
         return total
 
     def verify_installation(self, package_name: str) -> bool:
-        if package_name == "kernel-wedge":
-            return _has_packaging_tool()
         return _dpkg_installed(package_name)

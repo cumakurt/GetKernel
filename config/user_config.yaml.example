@@ -8,7 +8,8 @@ paths:
   packages_dir: data/packages
 
 kernel:
-  localversion: "-getkernel"
+  # Optional explicit suffix, e.g. "-custom". Empty keeps the upstream release.
+  localversion: ""
   reuse_downloads: true
 
 build:

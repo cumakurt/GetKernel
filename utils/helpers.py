@@ -108,22 +108,33 @@ def run_cmd(
     env: Optional[dict] = None,
     timeout: Optional[float] = None,
 ) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        args,
-        cwd=cwd,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
+    try:
+        return subprocess.run(
+            args,
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except OSError as exc:
+        # Read-only diagnostics (dkms, mokutil, lsmod, etc.) are optional on
+        # many hosts. Give callers a normal command-not-found style result
+        # instead of crashing the entire workflow.
+        return subprocess.CompletedProcess(args, 127, stdout="", stderr=str(exc))
 
 
 def which(cmd: str) -> Optional[str]:
     for d in os.environ.get("PATH", "").split(os.pathsep):
         p = Path(d) / cmd
-        if p.is_file() and os.access(p, os.X_OK):
-            return str(p)
+        try:
+            if p.is_file() and os.access(p, os.X_OK):
+                return str(p)
+        except OSError:
+            # PATH can contain inaccessible directories (containers and sudo
+            # environments commonly do); keep searching the remaining entries.
+            continue
     return None
 
 

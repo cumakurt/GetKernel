@@ -8,6 +8,7 @@ from pathlib import Path
 
 from utils.exceptions import SecurityError
 from utils.validator import (
+    canonical_kernel_release,
     check_file_safety,
     path_is_within,
     safe_extract_tarball,
@@ -15,10 +16,31 @@ from utils.validator import (
     validate_boot_backup_filename,
     validate_build_id,
     validate_kernel_version,
+    validate_kernel_release,
+    validate_localversion,
 )
 
 
 class TestValidator(unittest.TestCase):
+    def test_localversion_is_empty_by_default_or_safe_suffix(self) -> None:
+        self.assertTrue(validate_localversion(""))
+        self.assertTrue(validate_localversion("-custom.1"))
+        self.assertFalse(validate_localversion("getkernel"))
+        self.assertFalse(validate_localversion("-bad/path"))
+
+    def test_kernel_release_rejects_paths(self) -> None:
+        self.assertTrue(validate_kernel_release("6.12.8-custom"))
+        self.assertFalse(validate_kernel_release("../../6.12.8"))
+
+    def test_canonical_kernel_release_adds_kbuild_sublevel(self) -> None:
+        self.assertEqual(canonical_kernel_release("6.12.8"), "6.12.8")
+        self.assertEqual(canonical_kernel_release("6.13"), "6.13.0")
+        self.assertEqual(canonical_kernel_release("6.13-rc1"), "6.13.0-rc1")
+        self.assertEqual(
+            canonical_kernel_release("6.13-rc1", "-custom"),
+            "6.13.0-rc1-custom",
+        )
+
     def test_validate_kernel_version(self) -> None:
         self.assertTrue(validate_kernel_version("6.12.8"))
         self.assertTrue(validate_kernel_version("6.13-rc1"))

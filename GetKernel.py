@@ -27,6 +27,7 @@ from modules.grub_manager import GrubManager
 from modules.package_depot import (
     list_archived_builds,
     list_latest_packages,
+    read_build_info,
     read_build_history,
     resolve_package_paths,
 )
@@ -44,7 +45,7 @@ from utils.constants import (
     DEVELOPER_LINKEDIN_URL,
     DEVELOPER_NAME,
 )
-from utils.exceptions import ConfigError, DependencyError, GetKernelError
+from utils.exceptions import CompilationError, ConfigError, DependencyError, GetKernelError
 from utils.helpers import (
     assume_yes_from_env,
     ensure_elevated,
@@ -67,7 +68,14 @@ from utils.ui import (
     print_table,
     prompt_kernel_selection,
 )
-from utils.validator import validate_backup_id, validate_build_id, validate_kernel_version
+from utils.validator import (
+    canonical_kernel_release,
+    validate_backup_id,
+    validate_build_id,
+    validate_kernel_release,
+    validate_kernel_version,
+    validate_localversion,
+)
 
 _VERSION_MESSAGE = (
     "%(prog)s %(version)s\n"
@@ -188,8 +196,7 @@ def _prompt_rebuild_or_quit(
 
 def _install_kernel_packages_phase(
     moved: List[Path],
-    version: str,
-    localver: str,
+    kernel_release: str,
     skip_install: bool,
     assume_yes_install: bool,
     log: logging.Logger,
@@ -208,18 +215,23 @@ def _install_kernel_packages_phase(
         return
     print_build_success_summary(len(moved), moved[0].parent, build_log)
     inst = Installer()
+    runtime_packages = inst.select_runtime_packages(moved)
+    if not runtime_packages:
+        raise click.ClickException(
+            "No installable kernel image/header packages were found in the build output."
+        )
     install_yes = assume_yes_install or assume_yes_from_env()
     if not inst.request_installation_approval(
-        moved,
+        runtime_packages,
         assume_yes=install_yes,
         default_confirm=True,
     ):
         click.echo("Installation skipped.")
         return
-    hint = f"{version}{localver}"
+    hint = kernel_release
     try:
         ok, ilog, (verified, issues) = inst.install_from_paths(
-            moved,
+            runtime_packages,
             kernel_version_hint=hint,
             create_backup_first=True,
         )
@@ -488,28 +500,50 @@ def cmd_install(ctx: click.Context, build_id: Optional[str], kernel_version: Opt
     if not packages:
         click.echo("No packages found in the depot.", err=True)
         sys.exit(1)
-    inst = Installer()
-    assume_yes = bool(ctx.obj.get("assume_yes")) or assume_yes_from_env()
-    for warning in collect_install_warnings(kernel_version or ""):
-        click.echo(click.style(f"Warning: {warning}", fg="yellow"))
-    if not inst.request_installation_approval(packages, assume_yes=assume_yes):
-        click.echo("Installation cancelled.")
-        return
     hint = kernel_version
     if not hint:
-        info_path = paths["packages"] / "latest" / "build-info.json"
-        if info_path.is_file():
-            try:
-                meta = json.loads(info_path.read_text(encoding="utf-8"))
-                rv = meta.get("requested_version", "")
-                lv = meta.get("localversion", "")
-                if rv:
-                    hint = f"{rv}{lv}"
-            except (OSError, ValueError, json.JSONDecodeError):
-                hint = None
+        meta = read_build_info(paths["packages"], build_id=build_id)
+        recorded_release = meta.get("kernel_release", "")
+        if isinstance(recorded_release, str) and recorded_release:
+            hint = recorded_release
+        else:
+            rv = meta.get("requested_version", "")
+            lv = meta.get("localversion", "")
+            suffix = lv if isinstance(lv, str) else ""
+            if (
+                isinstance(rv, str)
+                and validate_kernel_version(rv)
+                and validate_localversion(suffix)
+            ):
+                hint = canonical_kernel_release(rv, suffix)
+    if hint and not validate_kernel_release(hint):
+        click.echo(f"Invalid kernel release: {hint!r}", err=True)
+        sys.exit(1)
+
+    verifier = PackageBuilder(str(paths["builds"]), output_dir=str(paths["packages"]))
+    valid, package_errors = verifier.verify_packages(
+        packages,
+        expected_kernel_release=hint,
+        require_headers=bool(hint),
+    )
+    if not valid:
+        click.echo("Package verification failed: " + "; ".join(package_errors), err=True)
+        sys.exit(1)
+
+    inst = Installer()
+    runtime_packages = inst.select_runtime_packages(packages)
+    if not runtime_packages:
+        click.echo("No kernel image/header packages found in the selected build.", err=True)
+        sys.exit(1)
+    assume_yes = bool(ctx.obj.get("assume_yes")) or assume_yes_from_env()
+    for warning in collect_install_warnings(hint or ""):
+        click.echo(click.style(f"Warning: {warning}", fg="yellow"))
+    if not inst.request_installation_approval(runtime_packages, assume_yes=assume_yes):
+        click.echo("Installation cancelled.")
+        return
     try:
         ok, ilog, (verified, issues) = inst.install_from_paths(
-            packages,
+            runtime_packages,
             kernel_version_hint=hint,
             create_backup_first=True,
         )
@@ -641,7 +675,7 @@ def run_build_flow(
     log = setup_logging(paths["logs"], **cfg.get("logging", {}))
 
     # Validate kernel version to prevent path traversal or malformed URLs
-    if not source_dir and not validate_kernel_version(version):
+    if not validate_kernel_version(version):
         click.echo(
             click.style(
                 f"Invalid kernel version format: {version!r}. "
@@ -652,8 +686,14 @@ def run_build_flow(
         )
         sys.exit(1)
 
-    kv = cfg.get("kernel", {})
-    localver = str(kv.get("localversion", "-getkernel"))
+    kv_value = cfg.get("kernel") or {}
+    kv = kv_value if isinstance(kv_value, dict) else {}
+    configured_localver = kv.get("localversion", "")
+    localver = "" if configured_localver is None else str(configured_localver).strip()
+    if not validate_localversion(localver):
+        raise click.UsageError(
+            "kernel.localversion must be empty or a path-safe suffix such as '-custom'."
+        )
     build_cfg = cfg.get("build") or {}
     pkg_target = str(build_cfg.get("target", "bindeb-pkg"))
     root = project_root()
@@ -701,8 +741,17 @@ def run_build_flow(
 
     if source_dir:
         src = Path(source_dir).resolve()
-        if not (src / "Makefile").is_file():
-            click.echo("Invalid kernel source (no Makefile).", err=True)
+        if not all(
+            (
+                (src / "Makefile").is_file(),
+                (src / "Kconfig").is_file(),
+                (src / "scripts" / "kconfig").is_dir(),
+            )
+        ):
+            click.echo(
+                "Invalid kernel source (expected Makefile, Kconfig, and scripts/kconfig).",
+                err=True,
+            )
             sys.exit(1)
     else:
         fetcher = _make_fetcher(cfg, paths["cache"])
@@ -754,20 +803,45 @@ def run_build_flow(
         if use_lmc_build:
             click.echo("Running make localmodconfig …")
             cm.run_localmodconfig()
+        cleared_keys = cm.prepare_external_module_config(localver)
+        if cleared_keys:
+            click.echo(
+                click.style(
+                    "Cleared unavailable distribution certificate paths: "
+                    + ", ".join(cleared_keys),
+                    fg="yellow",
+                )
+            )
+        config_ok, config_errors = cm.validate_config()
+        if not config_ok:
+            raise ConfigError("Kernel config is not module-compatible: " + "; ".join(config_errors))
     except GetKernelError as exc:
         log_exception(log, exc, {})
         raise click.Abort() from exc
 
     comp = Compiler(str(src))
-    if not use_llvm_build:
+    if bool(build_cfg.get("use_ccache", True)) and not use_llvm_build:
         comp.enable_ccache()
     last_build_log: Optional[Path] = None
     try:
         if resume_build and comp.has_partial_build():
             click.echo(click.style("Resuming previous partial build …", fg="green"))
-            comp.prepare_source(resume=True)
+            comp.prepare_source(resume=True, local_version=localver)
         else:
-            comp.prepare_source()
+            if not dry_run and comp.has_partial_build():
+                click.echo("Cleaning previous partial build artifacts …")
+                if not comp.clean_build("normal"):
+                    raise CompilationError("make clean failed before the fresh build")
+            comp.prepare_source(local_version=localver)
+        kernel_release = comp.get_kernel_release(localver)
+        expected_release = canonical_kernel_release(version, localver)
+        if not source_dir and kernel_release != expected_release:
+            raise CompilationError(
+                "Unexpected kernel release: "
+                f"Kbuild reported {kernel_release!r}, expected {expected_release!r}. "
+                "Refusing to create packages under an unrequested module path."
+            )
+        click.echo(f"Kernel release: {kernel_release}")
         if dry_run:
             click.echo(
                 click.style(
@@ -788,6 +862,7 @@ def run_build_flow(
             build_id,
             {
                 "version": version,
+                "kernel_release": kernel_release,
                 "target": make_t,
                 "log": str(build_log),
                 "llvm": use_llvm_build,
@@ -838,11 +913,18 @@ def run_build_flow(
         raise click.Abort() from exc
 
     pb = PackageBuilder(str(src), output_dir=str(pkg_out))
-    debs = pb.find_built_packages()
+    debs = pb.find_built_packages(
+        expected_kernel_release=kernel_release,
+        modified_after=comp.compilation_start_time,
+    )
     if not debs:
         click.echo("No .deb files found next to the build directory.", err=True)
         sys.exit(1)
-    ok, errs = pb.verify_packages(debs)
+    ok, errs = pb.verify_packages(
+        debs,
+        expected_kernel_release=kernel_release,
+        require_headers=True,
+    )
     if not ok:
         click.echo("Package verification failed: " + "; ".join(errs), err=True)
         sys.exit(1)
@@ -850,12 +932,12 @@ def run_build_flow(
         debs,
         requested_version=version,
         localversion=localver,
+        kernel_release=kernel_release,
         build_id=build_id if not dry_run else None,
     )
     _install_kernel_packages_phase(
         moved,
-        version,
-        localver,
+        kernel_release,
         skip_install,
         assume_yes_install,
         log,
