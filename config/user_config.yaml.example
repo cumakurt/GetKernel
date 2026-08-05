@@ -11,6 +11,8 @@ kernel:
   # Optional explicit suffix, e.g. "-custom". Empty keeps the upstream release.
   localversion: ""
   reuse_downloads: true
+  # true fails closed if kernel.org has no SHA256 entry (common for generated RC snapshots).
+  verify_checksum: true
 
 build:
   jobs: null

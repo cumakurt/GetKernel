@@ -1,13 +1,13 @@
 """Compiler target resolution and build progress."""
 
+import subprocess
 import tempfile
 import time
 import unittest
-import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
-from modules.compiler import CompilationProgress, Compiler
+from modules.compiler import BUILD_LOG_TAIL_LINES, CompilationProgress, Compiler
 from utils.exceptions import CompilationError
 
 
@@ -74,6 +74,15 @@ class TestCompilerResolve(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             with self.assertRaises(CompilationError):
                 Compiler(td).compile_kernel(jobs=0)
+
+    def test_in_memory_build_log_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            compiler = Compiler(td)
+            for index in range(BUILD_LOG_TAIL_LINES + 50):
+                compiler._log_lines.append(f"line-{index}\n")
+            retained = compiler.get_build_log()
+            self.assertNotIn("line-0\n", retained)
+            self.assertIn(f"line-{BUILD_LOG_TAIL_LINES + 49}\n", retained)
 
 
 if __name__ == "__main__":

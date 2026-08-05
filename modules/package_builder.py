@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import shutil
+import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -87,7 +90,8 @@ def _fuzzy_match_stored_packages(
     for p in images:
         n = p.name.lower()
         package_name = n.split("_", 1)[0]
-        release = package_name.removeprefix("linux-image-")
+        prefix = "linux-image-"
+        release = package_name[len(prefix) :] if package_name.startswith(prefix) else package_name
         if release == expected_release:
             matched_image = p
             break
@@ -163,6 +167,7 @@ class PackageBuilder:
     ) -> Tuple[bool, List[str]]:
         errors: List[str] = []
         package_names: List[str] = []
+        errors.extend(self._verify_depot_checksums(package_list))
         for deb in package_list:
             try:
                 size = deb.stat().st_size
@@ -211,6 +216,59 @@ class PackageBuilder:
                 )
         return len(errors) == 0, errors
 
+    @classmethod
+    def _verify_depot_checksums(cls, package_list: List[Path]) -> List[str]:
+        """Verify checksums when packages come from a GetKernel depot set."""
+        if not package_list:
+            return []
+        parents = {package.resolve().parent for package in package_list}
+        if len(parents) != 1:
+            return []
+        checksum_file = next(iter(parents)) / "checksums.sha256"
+        if not checksum_file.is_file():
+            return []  # Backward compatibility with builds created before manifests.
+        try:
+            lines = checksum_file.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            return [f"cannot read {checksum_file}: {exc}"]
+        expected: Dict[str, str] = {}
+        for line in lines:
+            parts = line.split()
+            if len(parts) != 2:
+                return [f"invalid checksum manifest line: {line!r}"]
+            digest, name = parts
+            name = name.lstrip("*")
+            if (
+                Path(name).name != name
+                or len(digest) != 64
+                or any(c not in "0123456789abcdefABCDEF" for c in digest)
+            ):
+                return [f"invalid checksum manifest entry: {line!r}"]
+            if name in expected:
+                return [f"duplicate checksum manifest entry: {name}"]
+            expected[name] = digest.lower()
+        errors: List[str] = []
+        for package in package_list:
+            digest = expected.get(package.name)
+            if digest is None:
+                errors.append(f"missing checksum entry: {package.name}")
+                continue
+            try:
+                actual = cls._sha256_file(package)
+            except OSError as exc:
+                errors.append(f"cannot checksum {package.name}: {exc}")
+                continue
+            if not hmac.compare_digest(actual, digest):
+                errors.append(f"checksum mismatch: {package.name}")
+        # A truncated depot set could otherwise disappear from package_list
+        # before verification. Check that every package recorded at publish
+        # time is still physically present, including optional/debug artifacts.
+        parent = next(iter(parents))
+        for name in expected:
+            if name.endswith(".deb") and not (parent / name).is_file():
+                errors.append(f"missing depot package: {name}")
+        return errors
+
     def get_package_info(self, deb_file: Path) -> Dict[str, str]:
         cp = run_cmd(["dpkg-deb", "-f", str(deb_file)])
         info: Dict[str, str] = {"file": str(deb_file)}
@@ -240,34 +298,69 @@ class PackageBuilder:
         kernel_release: Optional[str] = None,
         build_id: Optional[str] = None,
     ) -> List[Path]:
-        sub = self.output_dir / "latest"
-        sub.mkdir(parents=True, exist_ok=True)
-        # ``latest`` is one coherent build set. Old files must not leak into a
-        # new install or archive when package names differ between releases.
-        for old in sub.glob("linux-*.deb"):
-            old.unlink()
-        for metadata_name in (BUILD_INFO_FILENAME, "packages.manifest", "checksums.sha256"):
-            old = sub / metadata_name
-            if old.is_file():
-                old.unlink()
-        out_paths: List[Path] = []
-        for p in packages:
-            dest = sub / p.name
-            shutil.copy2(p, dest)
-            out_paths.append(dest)
-        if create_manifest and out_paths:
-            checksums = self.calculate_checksums(out_paths)
-            self.create_manifest(out_paths, checksums=checksums)
-        if requested_version is not None and localversion is not None and out_paths:
-            self._write_build_info(
-                requested_version,
-                localversion,
-                out_paths,
-                kernel_release=kernel_release,
-                build_id=build_id,
-            )
-        if build_id and out_paths:
+        if not packages:
+            return []
+        names = [p.name for p in packages]
+        if len(set(names)) != len(names):
+            raise ValueError("Package list contains duplicate file names")
+        for package in packages:
+            if not package.is_file() or package.suffix != ".deb":
+                raise ValueError(f"Invalid package path: {package}")
+
+        latest = self.output_dir / "latest"
+        stage = Path(tempfile.mkdtemp(prefix=".latest-stage-", dir=self.output_dir))
+        previous = self.output_dir / f".latest-previous-{uuid.uuid4().hex}"
+        staged_paths: List[Path] = []
+        previous_moved = False
+        try:
+            for package in packages:
+                dest = stage / package.name
+                shutil.copy2(package, dest)
+                staged_paths.append(dest)
+            if create_manifest:
+                checksums = self.calculate_checksums(staged_paths, directory=stage)
+                self.create_manifest(staged_paths, checksums=checksums, directory=stage)
+            if requested_version is not None and localversion is not None:
+                self._write_build_info(
+                    requested_version,
+                    localversion,
+                    staged_paths,
+                    kernel_release=kernel_release,
+                    build_id=build_id,
+                    directory=stage,
+                )
+
+            # Publish only after every package and metadata file is complete.
+            # A failed copy therefore leaves the previous latest set untouched.
+            if latest.exists():
+                latest.replace(previous)
+                previous_moved = True
+            stage.replace(latest)
+        except BaseException:
+            if previous_moved and not latest.exists() and previous.exists():
+                previous.replace(latest)
+            if stage.exists():
+                shutil.rmtree(stage, ignore_errors=True)
+            raise
+        else:
+            if previous.exists():
+                shutil.rmtree(previous, ignore_errors=True)
+
+        out_paths = [latest / name for name in names]
+        if build_id:
             self._archive_build(build_id, out_paths)
+            from modules.package_depot import write_build_history_entry
+
+            write_build_history_entry(
+                self.output_dir,
+                build_id,
+                {
+                    "requested_version": requested_version or "",
+                    "localversion": localversion or "",
+                    "kernel_release": kernel_release or "",
+                    "deb_count": len(out_paths),
+                },
+            )
         return out_paths
 
     def _archive_build(self, build_id: str, packages: List[Path]) -> Path:
@@ -293,6 +386,7 @@ class PackageBuilder:
         *,
         kernel_release: Optional[str] = None,
         build_id: Optional[str] = None,
+        directory: Optional[Path] = None,
     ) -> None:
         data = {
             "requested_version": requested_version,
@@ -304,21 +398,8 @@ class PackageBuilder:
             data["kernel_release"] = kernel_release
         if build_id:
             data["build_id"] = build_id
-        dest = self.output_dir / "latest" / BUILD_INFO_FILENAME
+        dest = (directory or self.output_dir / "latest") / BUILD_INFO_FILENAME
         dest.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        if build_id:
-            from modules.package_depot import write_build_history_entry
-
-            write_build_history_entry(
-                self.output_dir,
-                build_id,
-                {
-                    "requested_version": requested_version,
-                    "localversion": localversion,
-                    "kernel_release": kernel_release or "",
-                    "deb_count": len(packages),
-                },
-            )
 
     @staticmethod
     def _sha256_file(path: Path) -> str:
@@ -333,8 +414,9 @@ class PackageBuilder:
         packages: List[Path],
         *,
         checksums: Optional[Dict[str, str]] = None,
+        directory: Optional[Path] = None,
     ) -> Path:
-        manifest = self.output_dir / "latest" / "packages.manifest"
+        manifest = (directory or self.output_dir / "latest") / "packages.manifest"
         lines = []
         for p in packages:
             sha = (checksums or {}).get(p.name) or self._sha256_file(p)
@@ -342,9 +424,14 @@ class PackageBuilder:
         manifest.write_text("".join(lines), encoding="utf-8")
         return manifest
 
-    def calculate_checksums(self, packages: List[Path]) -> Dict[str, str]:
+    def calculate_checksums(
+        self,
+        packages: List[Path],
+        *,
+        directory: Optional[Path] = None,
+    ) -> Dict[str, str]:
         out: Dict[str, str] = {}
-        chk = self.output_dir / "latest" / "checksums.sha256"
+        chk = (directory or self.output_dir / "latest") / "checksums.sha256"
         parts = []
         for p in packages:
             h = self._sha256_file(p)
@@ -374,18 +461,29 @@ class PackageBuilder:
         When *dry_run* is True, nothing is deleted; the return value is how many
         files would be removed.
         """
-        removed = 0
-        # Clean the kernel source tree (make mrproper artefacts)
-        for pattern in ("*.o", "*.ko", "*.cmd", "*.mod", "*.mod.c"):
-            for p in self.build_dir.rglob(pattern):
-                if dry_run:
-                    removed += 1
-                    continue
-                try:
-                    p.unlink()
-                    removed += 1
-                except OSError:
-                    pass
+        artifact_suffixes = (".o", ".ko", ".cmd", ".mod", ".mod.c")
+        artifact_names = {"vmlinux", "System.map", "Module.symvers", "modules.order"}
+        artifacts: List[Path] = []
+        for path in self.build_dir.rglob("*"):
+            if path.is_file() and (
+                path.name in artifact_names
+                or path.name.endswith(artifact_suffixes)
+            ):
+                artifacts.append(path)
+        removed = len(artifacts) if dry_run else 0
+        if not dry_run:
+            # Kbuild knows all architecture-specific generated files. This is
+            # both more complete and faster than walking the tree once per glob.
+            clean = run_cmd(["make", "clean"], cwd=self.build_dir, timeout=3600)
+            if clean.returncode == 0:
+                removed = len(artifacts)
+            else:
+                for path in artifacts:
+                    try:
+                        path.unlink()
+                        removed += 1
+                    except OSError:
+                        pass
         # Optionally remove built debs from the build parent (originals)
         if not keep_packages:
             parent = self.build_dir.parent

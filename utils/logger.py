@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -20,9 +19,13 @@ class JSONFormatter(logging.Formatter):
             "module": record.module,
             "message": record.getMessage(),
         }
+        for key in ("event", "build_id", "error_type", "context"):
+            value = getattr(record, key, None)
+            if value not in (None, "", {}):
+                payload[key] = value
         if record.exc_info:
             payload["exc_info"] = self.formatException(record.exc_info)
-        return json.dumps(payload, ensure_ascii=False)
+        return json.dumps(payload, ensure_ascii=False, default=str)
 
 
 def setup_logging(
@@ -35,21 +38,18 @@ def setup_logging(
 
     root = logging.getLogger("getkernel")
     root.setLevel(getattr(logging, level.upper(), logging.INFO))
+    for existing in root.handlers:
+        existing.close()
     root.handlers.clear()
+    root.propagate = False
 
     handler_file = logging.FileHandler(log_file, encoding="utf-8")
-    handler_stream = logging.StreamHandler(sys.stderr)
-
     if json_format:
         handler_file.setFormatter(JSONFormatter())
-        handler_stream.setFormatter(JSONFormatter())
     else:
         plain = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
         handler_file.setFormatter(plain)
-        handler_stream.setFormatter(plain)
-
     root.addHandler(handler_file)
-    root.addHandler(handler_stream)
     return root
 
 
@@ -58,16 +58,16 @@ def log_exception(
     error: BaseException,
     context: Optional[Mapping[str, Any]] = None,
 ) -> None:
-    import traceback
-
-    entry = {
-        "level": "ERROR",
-        "error_type": type(error).__name__,
-        "message": str(error),
-        "traceback": traceback.format_exc(),
-        "context": dict(context or {}),
-    }
-    logger.error(json.dumps(entry, ensure_ascii=False))
+    logger.error(
+        str(error),
+        exc_info=(type(error), error, error.__traceback__)
+        if error.__traceback__ is not None
+        else None,
+        extra={
+            "error_type": type(error).__name__,
+            "context": dict(context or {}),
+        },
+    )
 
 
 def log_build_event(
@@ -77,7 +77,8 @@ def log_build_event(
     extra: Optional[Mapping[str, Any]] = None,
 ) -> None:
     """Structured build lifecycle line (JSON) for observability."""
-    payload: dict[str, Any] = {"event": event, "build_id": build_id}
-    if extra:
-        payload.update(dict(extra))
-    logger.info(json.dumps(payload, ensure_ascii=False))
+    context = dict(extra or {})
+    logger.info(
+        event,
+        extra={"event": event, "build_id": build_id, "context": context},
+    )

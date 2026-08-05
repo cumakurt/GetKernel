@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import tarfile
@@ -91,13 +92,54 @@ def safe_extract_path(target_dir: Path, member_name: str) -> Path:
 
 
 def safe_extract_tarball(tf: tarfile.TarFile, target_dir: Path) -> None:
-    """Extract only regular files and directories; reject symlinks and hard links."""
+    """Portable safe extraction for Python versions without tar filters.
+
+    Regular files, directories, and links that stay inside the extraction root
+    are supported so genuine kernel tarballs retain executable bits and links.
+    Devices, FIFOs, traversal, duplicate paths, and link-parent conflicts are
+    rejected.
+    """
     root = target_dir.resolve()
     root.mkdir(parents=True, exist_ok=True)
-    for member in tf.getmembers():
+    members = tf.getmembers()
+    names = set()
+    link_names = set()
+    for member in members:
         safe_extract_path(root, member.name)
+        normalized = member.name.rstrip("/")
+        if not normalized or normalized in names:
+            raise SecurityError(f"Duplicate or empty archive member: {member.name!r}")
+        names.add(normalized)
+        if member.issym() or member.islnk():
+            link_names.add(normalized)
+            if member.issym():
+                link_target = (root / normalized).parent / member.linkname
+            else:
+                link_target = root / member.linkname
+            try:
+                link_target.resolve().relative_to(root)
+            except ValueError as exc:
+                raise SecurityError(
+                    f"Unsafe archive link target: {member.name!r} -> {member.linkname!r}"
+                ) from exc
+        elif not (member.isdir() or member.isreg()):
+            raise SecurityError(f"Unsafe archive member type: {member.name!r}")
+
+    for member in members:
+        normalized = member.name.rstrip("/")
+        ancestors = Path(normalized).parents
+        if any(str(parent) in link_names for parent in ancestors if str(parent) != "."):
+            raise SecurityError(f"Archive member has a link parent: {member.name!r}")
+
+    # Materialise directories/files before links so a link cannot redirect a
+    # subsequent file write.
+    for member in members:
+        if member.issym() or member.islnk():
+            continue
         if member.isdir():
-            (root / member.name).mkdir(parents=True, exist_ok=True)
+            dest = safe_extract_path(root, member.name)
+            dest.mkdir(parents=True, exist_ok=True)
+            os.chmod(dest, member.mode & 0o777)
             continue
         if member.isreg():
             dest = safe_extract_path(root, member.name)
@@ -107,8 +149,21 @@ def safe_extract_tarball(tf: tarfile.TarFile, target_dir: Path) -> None:
                 raise SecurityError(f"Cannot extract archive member: {member.name!r}")
             with extracted as src, open(dest, "wb") as dst:
                 shutil.copyfileobj(src, dst)
+            os.chmod(dest, member.mode & 0o777)
             continue
-        raise SecurityError(f"Unsafe archive member type: {member.name!r}")
+
+    for member in members:
+        if not (member.issym() or member.islnk()):
+            continue
+        dest = safe_extract_path(root, member.name)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if member.issym():
+            os.symlink(member.linkname, dest)
+            continue
+        source = safe_extract_path(root, member.linkname)
+        if not source.is_file() or source.is_symlink():
+            raise SecurityError(f"Invalid archive hard-link target: {member.linkname!r}")
+        os.link(source, dest)
 
 
 def check_file_safety(filepath: Path, max_bytes: int = 600 * 1024 * 1024) -> Tuple[bool, str]:

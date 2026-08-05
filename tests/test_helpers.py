@@ -2,7 +2,8 @@
 
 import unittest
 
-from utils.helpers import assume_yes_from_env, needs_elevation
+from utils.exceptions import ConfigError
+from utils.helpers import assume_yes_from_env, load_yaml_config, needs_elevation
 
 
 class TestNeedsElevation(unittest.TestCase):
@@ -36,6 +37,12 @@ class TestNeedsElevation(unittest.TestCase):
 
     def test_build_needs(self) -> None:
         self.assertTrue(needs_elevation(["build", "--version", "6.12.0"]))
+
+    def test_global_yes_before_build_still_needs_elevation(self) -> None:
+        self.assertTrue(needs_elevation(["--yes", "build", "--version", "6.12.0"]))
+
+    def test_global_yes_without_command_launches_privileged_wizard(self) -> None:
+        self.assertTrue(needs_elevation(["--yes"]))
 
     def test_prepare_needs(self) -> None:
         self.assertTrue(needs_elevation(["prepare", "--version", "6.12.0"]))
@@ -77,6 +84,16 @@ class TestProjectRoot(unittest.TestCase):
                 self.assertEqual(project_root(), root.resolve())
             finally:
                 os.environ.pop("GETKERNEL_ROOT", None)
+
+    def test_yaml_config_rejects_non_mapping_root(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as td:
+            config = Path(td) / "config.yaml"
+            config.write_text("- not\n- a\n- mapping\n", encoding="utf-8")
+            with self.assertRaises(ConfigError):
+                load_yaml_config(config)
 
 
 if __name__ == "__main__":

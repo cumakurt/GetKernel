@@ -78,12 +78,10 @@ class ConfigManager:
         target = "oldconfig" if interactive else "olddefconfig"
         env = os.environ.copy()
         env.setdefault("TERM", "xterm")
-        cp = subprocess.run(
+        cp = run_cmd(
             ["make", target],
             cwd=self.kernel_source_dir,
             env=env,
-            capture_output=True,
-            text=True,
             timeout=3600,
         )
         if cp.returncode != 0:
@@ -111,11 +109,9 @@ class ConfigManager:
             if not rp.is_file():
                 raise ConfigError(f"Config fragment not found: {rp}")
             args.append(str(rp))
-        cp = subprocess.run(
+        cp = run_cmd(
             args,
             cwd=self.kernel_source_dir,
-            capture_output=True,
-            text=True,
             timeout=3600,
         )
         if cp.returncode != 0:
@@ -129,12 +125,10 @@ class ConfigManager:
             raise ConfigError(".config missing")
         env = os.environ.copy()
         env.setdefault("TERM", "xterm")
-        cp = subprocess.run(
+        cp = run_cmd(
             ["make", "localmodconfig"],
             cwd=self.kernel_source_dir,
             env=env,
-            capture_output=True,
-            text=True,
             timeout=3600,
         )
         if cp.returncode != 0:
@@ -146,12 +140,17 @@ class ConfigManager:
             raise ConfigError(".config missing")
         env = os.environ.copy()
         env.setdefault("TERM", "xterm")
-        cp = subprocess.run(
-            ["make", "menuconfig"],
-            cwd=self.kernel_source_dir,
-            env=env,
-            timeout=86400,
-        )
+        try:
+            cp = subprocess.run(
+                ["make", "menuconfig"],
+                cwd=self.kernel_source_dir,
+                env=env,
+                timeout=86400,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ConfigError("make menuconfig timed out") from exc
+        except OSError as exc:
+            raise ConfigError(f"Cannot start make menuconfig: {exc}") from exc
         if cp.returncode != 0:
             raise ConfigError("make menuconfig failed or was cancelled")
 

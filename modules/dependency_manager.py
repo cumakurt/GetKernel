@@ -18,6 +18,24 @@ def _dpkg_installed(name: str) -> bool:
     return "install ok installed" in cp.stdout
 
 
+def _installed_package_names(names: List[str]) -> set[str]:
+    """Query many package states in one dpkg process for a faster startup check."""
+    if not names:
+        return set()
+    cp = run_cmd(
+        ["dpkg-query", "-W", "-f=${Package}\t${Status}\n", *names],
+        timeout=60,
+    )
+    installed: set[str] = set()
+    # dpkg-query returns non-zero when any requested package is absent, while
+    # still printing valid rows for packages that are installed.
+    for line in cp.stdout.splitlines():
+        package, separator, status = line.partition("\t")
+        if separator and status.strip() == "install ok installed":
+            installed.add(package.strip())
+    return installed
+
+
 class DependencyManager:
     """Install build dependencies via apt."""
 
@@ -25,23 +43,16 @@ class DependencyManager:
         self.auto_install = auto_install
 
     def check_dependencies(self) -> Dict[str, bool]:
-        result: Dict[str, bool] = {}
-        for pkg in REQUIRED_PACKAGES:
-            result[pkg] = _dpkg_installed(pkg)
-        for pkg in OPTIONAL_PACKAGES:
-            result[pkg] = _dpkg_installed(pkg)
-        return result
+        packages = [*REQUIRED_PACKAGES, *OPTIONAL_PACKAGES]
+        installed = _installed_package_names(packages)
+        return {package: package in installed for package in packages}
 
     def get_missing_packages(self, include_optional: bool = False) -> List[str]:
-        missing: List[str] = []
-        for pkg in REQUIRED_PACKAGES:
-            if not _dpkg_installed(pkg):
-                missing.append(pkg)
+        packages = list(REQUIRED_PACKAGES)
         if include_optional:
-            for pkg in OPTIONAL_PACKAGES:
-                if not _dpkg_installed(pkg):
-                    missing.append(pkg)
-        return missing
+            packages.extend(OPTIONAL_PACKAGES)
+        installed = _installed_package_names(packages)
+        return [package for package in packages if package not in installed]
 
     def install_package(self, package_name: str) -> bool:
         return self._apt_install([package_name])[0]
@@ -74,31 +85,40 @@ class DependencyManager:
             )
         except subprocess.TimeoutExpired:
             return False, packages
+        except OSError as exc:
+            raise DependencyError(f"Cannot start apt-get: {exc}") from exc
         if cp.returncode != 0:
             return False, packages
-        failed: List[str] = []
-        for p in packages:
-            if not _dpkg_installed(p):
-                failed.append(p)
+        installed = _installed_package_names(packages)
+        failed = [package for package in packages if package not in installed]
         return len(failed) == 0, failed
 
     def update_package_cache(self) -> bool:
         cmd = sudo_prefix() + ["apt-get", "update", "-qq"]
-        cp = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        cp = run_cmd(cmd, timeout=600)
         return cp.returncode == 0
 
     def check_package_version(self, package_name: str, required_version: str) -> bool:
-        _ = required_version
-        return _dpkg_installed(package_name)
+        info = self.get_package_info(package_name)
+        if info["installed"] != "True" or not info["version"]:
+            return False
+        return (
+            run_cmd(
+                ["dpkg", "--compare-versions", info["version"], "ge", required_version],
+                timeout=60,
+            ).returncode
+            == 0
+        )
 
     def get_package_info(self, package_name: str) -> Dict[str, str]:
         cp = run_cmd(["dpkg-query", "-W", "-f=${Package}\t${Version}\t${Status}", package_name])
-        installed = _dpkg_installed(package_name)
+        installed = False
         version = ""
         if cp.returncode == 0 and cp.stdout:
             parts = cp.stdout.strip().split("\t")
             if len(parts) >= 2:
                 version = parts[1]
+            installed = len(parts) >= 3 and parts[2].strip() == "install ok installed"
         return {
             "name": package_name,
             "version": version,
@@ -114,7 +134,8 @@ class DependencyManager:
         total = 0
         for line in cp.stdout.splitlines():
             parts = line.split()
-            if len(parts) >= 3 and parts[0].startswith("http"):
+            uri = parts[0].strip("'\"") if parts else ""
+            if len(parts) >= 3 and uri.startswith(("http://", "https://")):
                 try:
                     total += int(parts[2])
                 except ValueError:

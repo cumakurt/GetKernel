@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import DefaultDict, List, Tuple
 
-
 # Display order (categories not in this list appear after, sorted by name).
 CATEGORY_ORDER: Tuple[str, ...] = (
     "Graphics / GPU",

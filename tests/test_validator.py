@@ -15,8 +15,8 @@ from utils.validator import (
     validate_backup_id,
     validate_boot_backup_filename,
     validate_build_id,
-    validate_kernel_version,
     validate_kernel_release,
+    validate_kernel_version,
     validate_localversion,
 )
 
@@ -92,6 +92,27 @@ class TestValidator(unittest.TestCase):
             with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as tf:
                 with self.assertRaises(SecurityError):
                     safe_extract_tarball(tf, target)
+
+    def test_safe_extract_tarball_preserves_mode_and_safe_relative_symlink(self) -> None:
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tf:
+            data = b"#!/bin/sh\n"
+            script = tarfile.TarInfo(name="linux-test/script.sh")
+            script.size = len(data)
+            script.mode = 0o755
+            tf.addfile(script, io.BytesIO(data))
+            link = tarfile.TarInfo(name="linux-test/script-link")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "script.sh"
+            tf.addfile(link)
+
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td)
+            with tarfile.open(fileobj=io.BytesIO(buf.getvalue()), mode="r:") as tf:
+                safe_extract_tarball(tf, target)
+            extracted = target / "linux-test" / "script.sh"
+            self.assertEqual(extracted.stat().st_mode & 0o777, 0o755)
+            self.assertEqual((target / "linux-test" / "script-link").read_bytes(), data)
 
 
 if __name__ == "__main__":

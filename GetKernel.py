@@ -20,15 +20,15 @@ import click
 from modules.compiler import Compiler
 from modules.config_manager import ConfigManager
 from modules.dependency_manager import DependencyManager
+from modules.grub_manager import GrubManager
 from modules.installer import Installer
 from modules.kernel_fetcher import KernelFetcher
 from modules.package_builder import PackageBuilder, find_matching_stored_packages
-from modules.grub_manager import GrubManager
 from modules.package_depot import (
     list_archived_builds,
     list_latest_packages,
-    read_build_info,
     read_build_history,
+    read_build_info,
     resolve_package_paths,
 )
 from modules.system_advisor import (
@@ -45,7 +45,12 @@ from utils.constants import (
     DEVELOPER_LINKEDIN_URL,
     DEVELOPER_NAME,
 )
-from utils.exceptions import CompilationError, ConfigError, DependencyError, GetKernelError
+from utils.exceptions import (
+    CompilationError,
+    ConfigError,
+    DependencyError,
+    GetKernelError,
+)
 from utils.helpers import (
     assume_yes_from_env,
     ensure_elevated,
@@ -118,7 +123,32 @@ def _load_config() -> Dict[str, Any]:
     root = project_root()
     base = load_yaml_config(root / "config" / "default_config.yaml")
     user = load_yaml_config(root / "config" / "user_config.yaml")
-    return merge_dict(base, user)
+    cfg = merge_dict(base, user)
+    sections = (
+        "paths",
+        "kernel",
+        "build",
+        "system",
+        "logging",
+        "dependencies",
+    )
+    for name in sections:
+        if name in cfg and not isinstance(cfg[name], dict):
+            raise ConfigError(f"Configuration section {name!r} must be a mapping.")
+    boolean_fields = {
+        "kernel": ("include_beta", "include_rc", "verify_checksum", "verify_signature", "reuse_downloads"),
+        "build": ("use_ccache", "use_llvm", "localmodconfig"),
+        "logging": ("json_format",),
+        "dependencies": ("auto_install", "apt_update", "install_optional"),
+    }
+    for section, fields in boolean_fields.items():
+        values = cfg.get(section) or {}
+        for field in fields:
+            if field in values and not isinstance(values[field], bool):
+                raise ConfigError(
+                    f"Configuration value {section}.{field} must be true or false."
+                )
+    return cfg
 
 
 def _paths(cfg: Dict[str, Any]) -> Dict[str, Path]:
@@ -130,6 +160,28 @@ def _paths(cfg: Dict[str, Any]) -> Dict[str, Path]:
         "builds": resolve_path(root, str(p.get("build_root", "data/builds"))),
         "packages": resolve_path(root, str(p.get("packages_dir", "data/packages"))),
     }
+
+
+def _make_system_checker(cfg: Dict[str, Any], paths: Dict[str, Path]) -> SystemChecker:
+    """Create a checker that honours configured limits and the real build filesystem."""
+    raw = cfg.get("system") or {}
+    system_cfg = raw if isinstance(raw, dict) else {}
+    try:
+        min_disk_gb = int(system_cfg.get("min_disk_gb", 20))
+        min_ram_gb = int(system_cfg.get("min_ram_gb", 4))
+    except (TypeError, ValueError) as exc:
+        raise click.UsageError(
+            "system.min_disk_gb and system.min_ram_gb must be positive integers."
+        ) from exc
+    if min_disk_gb < 1 or min_ram_gb < 1:
+        raise click.UsageError(
+            "system.min_disk_gb and system.min_ram_gb must be positive integers."
+        )
+    return SystemChecker(
+        min_disk_gb=min_disk_gb,
+        min_ram_gb=min_ram_gb,
+        disk_path=str(paths["builds"]),
+    )
 
 
 def _collect_config_fragments(
@@ -251,7 +303,7 @@ def _install_kernel_packages_phase(
             )
     except GetKernelError as exc:
         log_exception(log, exc, {})
-        raise click.Abort() from exc
+        raise
     click.echo("Done. Reboot to boot the new kernel when ready.")
 
 
@@ -288,11 +340,11 @@ def _ensure_build_dependencies(cfg: Dict[str, Any], log: logging.Logger) -> None
             err=True,
         )
         log_exception(log, exc, {})
-        raise click.Abort() from exc
+        raise
     if not ok:
         click.echo("Failed to install: " + ", ".join(failed), err=True)
         log_exception(log, RuntimeError("apt install failed"), {"failed": failed})
-        raise click.Abort()
+        raise DependencyError("Failed to install: " + ", ".join(failed))
     click.echo(click.style("Dependencies installed.", fg="green"))
 
 
@@ -321,7 +373,7 @@ def cmd_check(as_json: bool) -> None:
     cfg = _load_config()
     paths = _paths(cfg)
     setup_logging(paths["logs"], **cfg.get("logging", {}))
-    sc = SystemChecker()
+    sc = _make_system_checker(cfg, paths)
     vr = sc.validate_environment()
     payload = {
         "valid": vr.is_valid,
@@ -403,7 +455,7 @@ def cmd_deps(install: bool) -> None:
         ok, failed = dm.install_all_dependencies()
         if not ok:
             log_exception(log, RuntimeError("apt install failed"), {"failed": failed})
-            raise click.Abort()
+            raise DependencyError("Failed to install: " + ", ".join(failed))
         click.echo("Dependencies installed.")
     else:
         click.echo("Run with --install to apt-get install these packages.")
@@ -558,7 +610,7 @@ def cmd_install(ctx: click.Context, build_id: Optional[str], kernel_version: Opt
             )
     except GetKernelError as exc:
         log_exception(log, exc, {})
-        raise click.Abort() from exc
+        raise
 
 
 @cli.group("packages")
@@ -703,19 +755,49 @@ def run_build_flow(
         else paths["packages"]
     )
 
-    sc = SystemChecker()
+    sc = _make_system_checker(cfg, paths)
     vr = sc.validate_environment()
+    dependencies_checked = False
+    repairable_errors = [
+        error
+        for error in vr.errors
+        if error.startswith("Required command not found in PATH: ")
+        and not error.endswith(("dpkg", "apt-get"))
+    ]
+    blocking_errors = [error for error in vr.errors if error not in repairable_errors]
+    dependency_cfg = cfg.get("dependencies") or {}
+    if (
+        repairable_errors
+        and not blocking_errors
+        and dependency_cfg.get("auto_install", True)
+    ):
+        click.echo("Build tools are missing; attempting configured dependency installation.")
+        _ensure_build_dependencies(cfg, log)
+        dependencies_checked = True
+        vr = sc.validate_environment()
     if not vr.is_valid:
         for e in vr.errors:
             print_error_block("Environment check failed", e, vr.recommendations)
         sys.exit(1)
 
-    for warning in collect_build_warnings(version):
+    build_warnings = collect_build_warnings(version)
+    if not bool(kv.get("verify_checksum", True)):
+        build_warnings.insert(
+            0,
+            "SHA256 source verification is disabled; authenticity relies on HTTPS "
+            "unless PGP verification is enabled.",
+        )
+    for warning in build_warnings:
         click.echo(click.style(f"Warning: {warning}", fg="yellow"))
-        if sys.stdin.isatty() and not assume_yes_install and not assume_yes_from_env():
-            if not confirm("Continue despite warnings?", default=True):
-                click.echo("Cancelled.")
-                return
+    if (
+        build_warnings
+        and sys.stdin.isatty()
+        and not assume_yes_install
+        and not assume_yes_from_env()
+        and not confirm("Continue despite these warnings?", default=True)
+    ):
+        click.echo("Cancelled.")
+        return
 
     has_frags = bool(config_fragments) or bool(build_cfg.get("config_fragments")) or bool(profile)
     reuse_allowed = (
@@ -737,7 +819,8 @@ def run_build_flow(
             if action == "quit":
                 return
 
-    _ensure_build_dependencies(cfg, log)
+    if not dependencies_checked:
+        _ensure_build_dependencies(cfg, log)
 
     if source_dir:
         src = Path(source_dir).resolve()
@@ -766,7 +849,7 @@ def run_build_flow(
             )
         except GetKernelError as exc:
             log_exception(log, exc, {})
-            raise click.Abort() from exc
+            raise
         if prep_status == "reuse_tree":
             click.echo(click.style("Reusing existing source tree (skip download).", fg="green"))
         elif prep_status == "reuse_tarball":
@@ -817,7 +900,7 @@ def run_build_flow(
             raise ConfigError("Kernel config is not module-compatible: " + "; ".join(config_errors))
     except GetKernelError as exc:
         log_exception(log, exc, {})
-        raise click.Abort() from exc
+        raise
 
     comp = Compiler(str(src))
     if bool(build_cfg.get("use_ccache", True)) and not use_llvm_build:
@@ -910,7 +993,7 @@ def run_build_flow(
                 "log": str(getattr(comp, "last_build_log_path", "") or ""),
             },
         )
-        raise click.Abort() from exc
+        raise
 
     pb = PackageBuilder(str(src), output_dir=str(pkg_out))
     debs = pb.find_built_packages(
@@ -928,13 +1011,16 @@ def run_build_flow(
     if not ok:
         click.echo("Package verification failed: " + "; ".join(errs), err=True)
         sys.exit(1)
-    moved = pb.move_packages(
-        debs,
-        requested_version=version,
-        localversion=localver,
-        kernel_release=kernel_release,
-        build_id=build_id if not dry_run else None,
-    )
+    try:
+        moved = pb.move_packages(
+            debs,
+            requested_version=version,
+            localversion=localver,
+            kernel_release=kernel_release,
+            build_id=build_id if not dry_run else None,
+        )
+    except (OSError, ValueError) as exc:
+        raise GetKernelError(f"Cannot publish built packages: {exc}") from exc
     _install_kernel_packages_phase(
         moved,
         kernel_release,
@@ -1148,17 +1234,17 @@ def interactive(ctx: click.Context) -> None:
     total_steps = 5
 
     print_step(1, total_steps, "Current system — kernel, hardware, loaded modules")
-    sc = SystemChecker()
+    sc = _make_system_checker(cfg, paths)
     snapshot = sc.get_interactive_snapshot()
     print_interactive_snapshot(snapshot)
 
-    vr = sc.validate_environment()
+    vr = sc.validate_environment(system_info=snapshot["info"])
     print_table(
         "Quick validation",
         [
             {"item": "Debian-based", "ok": str(sc.is_debian_based())},
             {
-                "item": "Disk space (>= 20 GB target)",
+                "item": f"Disk space (>= {sc.min_disk_gb} GB target)",
                 "ok": str(vr.system_info.get("hardware", {}).get("disk", {}).get("ok", "")),
             },
             {

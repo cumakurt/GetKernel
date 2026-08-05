@@ -1,5 +1,6 @@
 """Tests for package_builder stored package detection."""
 
+import hashlib
 import json
 import tempfile
 import unittest
@@ -125,6 +126,27 @@ class TestFindMatchingStored(unittest.TestCase):
             metadata = json.loads((latest / BUILD_INFO_FILENAME).read_text(encoding="utf-8"))
             self.assertEqual(metadata["kernel_release"], "6.1.0")
 
+    def test_move_packages_keeps_previous_latest_when_copy_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "source"
+            source.mkdir()
+            output = root / "out"
+            latest = output / "latest"
+            latest.mkdir(parents=True)
+            previous = latest / "linux-image-6.0.0_1_amd64.deb"
+            previous.write_bytes(b"previous")
+            package = root / "linux-image-6.1.0_1_amd64.deb"
+            package.write_bytes(b"new")
+            pb = PackageBuilder(str(source), output_dir=str(output))
+
+            with patch("modules.package_builder.shutil.copy2", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    pb.move_packages([package])
+
+            self.assertEqual(previous.read_bytes(), b"previous")
+            self.assertFalse(any(output.glob(".latest-stage-*")))
+
     def test_verify_requires_matching_headers_for_external_modules(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -147,6 +169,60 @@ class TestFindMatchingStored(unittest.TestCase):
                     )
             self.assertFalse(ok)
             self.assertTrue(any("linux-headers" in error for error in errors))
+
+    def test_verify_detects_tampered_depot_package(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "source"
+            source.mkdir()
+            latest = root / "out" / "latest"
+            latest.mkdir(parents=True)
+            package = latest / "linux-image-6.1.0_1_amd64.deb"
+            package.write_bytes(b"tampered")
+            (latest / "checksums.sha256").write_text(
+                f"{'0' * 64}  {package.name}\n",
+                encoding="utf-8",
+            )
+            pb = PackageBuilder(str(source), output_dir=str(root / "out"))
+            with patch("modules.package_builder.run_cmd") as command:
+                command.return_value.returncode = 0
+                with patch.object(
+                    pb,
+                    "get_package_info",
+                    return_value={"package": "linux-image-6.1.0"},
+                ):
+                    ok, errors = pb.verify_packages([package])
+
+            self.assertFalse(ok)
+            self.assertTrue(any("checksum mismatch" in error for error in errors))
+
+    def test_verify_detects_package_missing_from_depot_set(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "source"
+            source.mkdir()
+            latest = root / "out" / "latest"
+            latest.mkdir(parents=True)
+            package = latest / "linux-image-6.1.0_1_amd64.deb"
+            package.write_bytes(b"image")
+            missing_name = "linux-headers-6.1.0_1_amd64.deb"
+            digest = hashlib.sha256(package.read_bytes()).hexdigest()
+            (latest / "checksums.sha256").write_text(
+                f"{digest}  {package.name}\n{'0' * 64}  {missing_name}\n",
+                encoding="utf-8",
+            )
+            pb = PackageBuilder(str(source), output_dir=str(root / "out"))
+            with patch("modules.package_builder.run_cmd") as command:
+                command.return_value.returncode = 0
+                with patch.object(
+                    pb,
+                    "get_package_info",
+                    return_value={"package": "linux-image-6.1.0"},
+                ):
+                    ok, errors = pb.verify_packages([package])
+
+            self.assertFalse(ok)
+            self.assertTrue(any("missing depot package" in error for error in errors))
 
 
 if __name__ == "__main__":

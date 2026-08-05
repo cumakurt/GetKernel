@@ -60,11 +60,18 @@ def assume_yes_from_env() -> bool:
 def load_yaml_config(path: Path) -> dict:
     import yaml
 
+    from utils.exceptions import ConfigError
+
     if not path.is_file():
         return {}
-    with open(path, encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    return data if isinstance(data, dict) else {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        raise ConfigError(f"Cannot read YAML config {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ConfigError(f"YAML config root must be a mapping: {path}")
+    return data
 
 
 def merge_dict(base: dict, override: dict) -> dict:
@@ -118,6 +125,16 @@ def run_cmd(
             timeout=timeout,
             check=False,
         )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        detail = f"command timed out after {timeout:g}s" if timeout is not None else "command timed out"
+        return subprocess.CompletedProcess(
+            args,
+            124,
+            stdout=stdout,
+            stderr=f"{stderr.rstrip()}\n{detail}".lstrip(),
+        )
     except OSError as exc:
         # Read-only diagnostics (dkms, mokutil, lsmod, etc.) are optional on
         # many hosts. Give callers a normal command-not-found style result
@@ -158,18 +175,34 @@ def needs_elevation(argv: list[str]) -> bool:
     """
     if any(arg in ("-h", "--help") for arg in argv):
         return False
-    if argv and argv[0] in ("--version",):
-        return False
     if not argv:
         return True
-    first = argv[0]
-    if first in ("check", "list", "about", "status", "packages", "backups"):
-        return False
-    if first in ("install", "rollback", "uninstall", "cleanup"):
+
+    # Click accepts global flags before the subcommand (for example
+    # ``getkernel --yes build``). Find the actual command instead of assuming
+    # argv[0] is always it. A lone --yes still launches the interactive wizard.
+    command: Optional[str] = None
+    for arg in argv:
+        if arg in ("--yes", "-y"):
+            continue
+        if arg == "--version":
+            return False
+        if arg.startswith("-"):
+            # Unknown global options will be rejected by Click and must not
+            # trigger an unnecessary sudo prompt first.
+            return False
+        command = arg
+        break
+
+    if command is None:
         return True
-    if first == "deps":
+    if command in ("check", "list", "about", "status", "packages", "backups"):
+        return False
+    if command in ("install", "rollback", "uninstall", "cleanup"):
+        return True
+    if command == "deps":
         return "--install" in argv
-    if first in ("interactive", "build", "prepare"):
+    if command in ("interactive", "build", "prepare"):
         return True
     return False
 

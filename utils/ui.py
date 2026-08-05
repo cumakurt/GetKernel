@@ -7,13 +7,28 @@ import textwrap
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, List, Mapping, Optional, TYPE_CHECKING
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+)
 
 from rich import box
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
-from rich.progress import BarColumn, DownloadColumn, Progress, TextColumn, TransferSpeedColumn
+from rich.progress import (
+    BarColumn,
+    DownloadColumn,
+    Progress,
+    TextColumn,
+    TransferSpeedColumn,
+)
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 from rich.text import Text
@@ -189,16 +204,6 @@ def print_step(step: int, total: int, title: str) -> None:
     console.print()
 
 
-def _column_widths(
-    columns: List[str], rows: List[Mapping[str, Any]]
-) -> List[int]:
-    widths = [len(c) for c in columns]
-    for row in rows:
-        for i, c in enumerate(columns):
-            widths[i] = max(widths[i], len(str(row.get(c, ""))))
-    return widths
-
-
 def _kernel_type_style(kind: str) -> str:
     k = (kind or "").lower()
     if k == "stable":
@@ -316,24 +321,21 @@ def print_table(title: str, rows: Iterable[Mapping[str, Any]], columns: List[str
         console.print()
         return
 
-    # Fallback: plain aligned columns
-    widths = _column_widths(columns, row_list)
-    parts = [str(col).ljust(widths[i]) for i, col in enumerate(columns)]
-    header = "  ".join(parts)
-    lines = [header, "-" * len(header)]
-    for row in row_list:
-        line = "  ".join(
-            str(row.get(c, "")).ljust(widths[i]) for i, c in enumerate(columns)
-        )
-        lines.append(line)
-    console.print(
-        Panel(
-            "\n".join(lines),
-            title=f"[bold]{title}[/]",
-            border_style="dim",
-            box=box.ROUNDED,
-        )
+    # Generic Rich table: long paths and metadata fold to the terminal width
+    # instead of producing an oversized preformatted panel.
+    table = Table(
+        title=f"[bold]{title}[/]",
+        box=box.ROUNDED,
+        border_style="dim",
+        header_style="bold cyan",
+        width=min(120, console.width),
+        padding=(0, 1),
     )
+    for column in columns:
+        table.add_column(str(column), overflow="fold")
+    for row in row_list:
+        table.add_row(*(str(row.get(column, "")) for column in columns))
+    console.print(table)
     console.print()
 
 

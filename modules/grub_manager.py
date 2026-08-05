@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import re
 import shutil
-import subprocess
 import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from utils.helpers import is_root, sudo_prefix
+from utils.helpers import is_root, run_cmd, sudo_prefix
 
 
 class GrubManager:
@@ -91,7 +90,7 @@ class GrubManager:
                 tmp.write(text)
                 tmp_path = tmp.name
             try:
-                r = subprocess.run(cmd + ["cp", tmp_path, str(self.config_file)])
+                r = run_cmd(cmd + ["cp", tmp_path, str(self.config_file)], timeout=60)
                 return r.returncode == 0
             finally:
                 Path(tmp_path).unlink(missing_ok=True)
@@ -102,7 +101,7 @@ class GrubManager:
         if not is_root() and not sudo_prefix():
             return False
         cmd = sudo_prefix() + ["update-grub"]
-        cp = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        cp = run_cmd(cmd, timeout=600)
         return cp.returncode == 0
 
     def set_timeout(self, seconds: int) -> bool:

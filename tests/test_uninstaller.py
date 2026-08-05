@@ -5,10 +5,25 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from modules.uninstaller import MARKER_BEGIN, detect_remnants
+from modules.uninstaller import (
+    MARKER_BEGIN,
+    _is_getkernel_regular_launcher,
+    detect_remnants,
+)
 
 
 class TestUninstaller(unittest.TestCase):
+    def test_regular_launcher_requires_getkernel_signature(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            launcher = Path(td) / "getkernel"
+            launcher.write_text("#!/bin/sh\necho unrelated\n", encoding="utf-8")
+            self.assertFalse(_is_getkernel_regular_launcher(launcher))
+            launcher.write_text(
+                "#!/bin/sh\nexec /usr/local/getkernel/.venv/bin/getkernel \"$@\"\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(_is_getkernel_regular_launcher(launcher))
+
     def test_detect_remnants_skips_missing_install_dir(self) -> None:
         missing = Path("/nonexistent-getkernel-dir-xyz")
         with patch("modules.uninstaller.GETKERNEL_INSTALL_DIR", missing):

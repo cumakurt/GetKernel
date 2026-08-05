@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import tempfile
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -12,6 +15,14 @@ from modules.package_builder import BUILD_INFO_FILENAME
 from utils.validator import path_is_within, validate_build_id
 
 ARCHIVE_DIRNAME = "archive"
+
+
+def _copy_or_link(source: Path, destination: Path) -> None:
+    """Hard-link immutable artifacts when possible; copy across filesystems."""
+    try:
+        os.link(source, destination)
+    except OSError:
+        shutil.copy2(source, destination)
 
 
 def _read_build_info(directory: Path) -> Dict[str, Any]:
@@ -126,14 +137,27 @@ def archive_latest_to_build_id(packages_dir: Path, build_id: str) -> Optional[Pa
     debs = _package_paths(latest)
     if not debs:
         return None
-    dest = packages_dir / ARCHIVE_DIRNAME / f"build-{build_id}"
-    dest.mkdir(parents=True, exist_ok=True)
-    for p in debs:
-        shutil.copy2(p, dest / p.name)
-    for meta_name in (BUILD_INFO_FILENAME, "packages.manifest", "checksums.sha256"):
-        src = latest / meta_name
-        if src.is_file():
-            shutil.copy2(src, dest / meta_name)
+    archive = packages_dir / ARCHIVE_DIRNAME
+    archive.mkdir(parents=True, exist_ok=True)
+    dest = archive / f"build-{build_id}"
+    if dest.exists():
+        raise FileExistsError(f"Archive already exists: {dest}")
+    stage = Path(tempfile.mkdtemp(prefix=f".build-{build_id}-", dir=archive))
+    try:
+        for p in debs:
+            _copy_or_link(p, stage / p.name)
+        for meta_name in (
+            BUILD_INFO_FILENAME,
+            "packages.manifest",
+            "checksums.sha256",
+        ):
+            src = latest / meta_name
+            if src.is_file():
+                _copy_or_link(src, stage / meta_name)
+        stage.replace(dest)
+    except BaseException:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
     return dest
 
 
@@ -148,14 +172,22 @@ def write_build_history_entry(packages_dir: Path, build_id: str, meta: Dict[str,
 
 
 def read_build_history(packages_dir: Path, limit: int = 20) -> List[Dict[str, Any]]:
+    if limit < 1:
+        return []
     hist = packages_dir / "build-history.jsonl"
     if not hist.is_file():
         return []
-    lines = hist.read_text(encoding="utf-8").splitlines()
+    try:
+        with open(hist, encoding="utf-8") as source:
+            lines = deque(source, maxlen=limit)
+    except OSError:
+        return []
     out: List[Dict[str, Any]] = []
-    for line in lines[-limit:]:
+    for line in lines:
         try:
-            out.append(json.loads(line))
+            row = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if isinstance(row, dict):
+            out.append(row)
     return list(reversed(out))

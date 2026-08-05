@@ -12,6 +12,14 @@ Build custom Linux kernel `.deb` packages on Debian-based systems: fetch from ke
   <img src="img/3.png" alt="Build complete — install prompt" width="280" />
 </p>
 
+### Reliability and integrity
+
+- kernel.org release metadata is cached for 15 minutes; a stale valid cache keeps version listing available during temporary network failures.
+- Complete source trees and verified tarballs are reused. Interrupted downloads resume only when the server confirms the requested byte range; failed mirrors cannot leave a corrupt tail for the next attempt.
+- SHA256 verification is **fail-closed by default**. Optional PGP verification checks kernel.org's detached signature against the uncompressed tar stream, as required by the [kernel.org signature guide](https://www.kernel.org/signature.html).
+- Archives are extracted through traversal/link protection into a staging directory and published only after a complete kernel source tree is confirmed.
+- Package sets are published transactionally with SHA256 manifests. Installation rechecks depot integrity and confirms that `dpkg`/`apt` left every requested runtime package installed.
+
 ## Quick start
 
 ```bash
@@ -50,6 +58,9 @@ Use direct commands such as `getkernel build --version 6.12.8` only when you alr
 
 - Python 3.8+
 - Debian, Ubuntu, Kali, or similar (dpkg/apt)
+- The standard build toolchain, including `gcc`, `make`, `tar`, `xz`, `dpkg-dev`, kernel build libraries, and packaging tools (`getkernel deps` reports the exact missing packages)
+- `gpg` only when `kernel.verify_signature` is enabled
+- By default, at least 20 GiB free on the configured build filesystem and 4 GiB RAM (swap contributes partially to the memory check); both thresholds are configurable
 - Root or sudo for installs, builds, and package deployment
 
 ## Installation
@@ -255,6 +266,8 @@ If matching `.deb` files already exist under `data/packages/latest/`, `build` of
 
 Each build writes `data/packages/latest/build-info.json` with `requested_version`, `localversion`, and the exact **`kernel_release`** from Kbuild. Package discovery and verification use that release so stale sibling `.deb` files are not picked up.
 
+`latest/` is replaced as one transactional build set only after all packages and metadata are complete. `checksums.sha256` is verified before install—including missing files—and archives use hard links when the filesystem supports them to avoid storing the same large `.deb` payload twice.
+
 After install, GetKernel verifies `/boot/vmlinuz-*`, `/lib/modules/<release>/`, and `/lib/modules/<release>/build` (headers symlink) when a kernel release hint is available.
 
 ## Privileges
@@ -287,9 +300,9 @@ flowchart LR
 
 | Module | Role |
 |--------|------|
-| **KernelFetcher** | kernel.org metadata; download/resume; SHA256; optional GPG; CDN mirror fallback; safe tarball extraction |
+| **KernelFetcher** | cached kernel.org metadata; safe download/resume; SHA256; optional GPG; CDN mirror fallback; atomic extraction |
 | **ConfigManager** | `.config` from running kernel or file; fragments; profiles; `menuconfig`; module-friendly Kconfig prep |
-| **Compiler** | `make bindeb-pkg` (default); live progress; `kernelrelease` detection; resume or clean partial builds |
+| **Compiler** | affinity-aware `make bindeb-pkg` (default); throttled live progress; bounded in-memory log; process-group cancellation |
 | **PackageBuilder** | Collect release-scoped `linux-*.deb` → `latest/`; verify image + headers; archive per build id |
 | **PackageDepot** | List and resolve packages from `latest/` and `archive/` (validated build ids) |
 | **Installer** | Runtime package selection; `dpkg` + `apt-get install -f`; initramfs; GRUB; backup/rollback; verify |
@@ -303,7 +316,8 @@ Tarball trees without `.git` use **`bindeb-pkg`** automatically (`deb-pkg` needs
 - Before compile, GetKernel normalises inherited distro Kconfig (disables `LOCALVERSION_AUTO`, keeps `CONFIG_MODULES`, clears missing distro certificate paths).
 - Kbuild **`kernelrelease`** is recorded and checked against the requested version before packaging.
 - A fresh build (without `--resume-build`) runs `make clean` when partial artefacts exist in the source tree.
-- Builds time out after **24 hours**; full output is logged under `data/logs/build-<id>.log`.
+- Builds time out after **24 hours**; timeout or cancellation terminates `make` and its compiler children. Full output is logged under `data/logs/build-<id>.log`, while only the last 500 diagnostic lines stay in RAM.
+- With `build.jobs: null`, parallelism follows the CPUs available to the process, including container/cgroup affinity limits. Live terminal updates are throttled to avoid repainting on every compiler line.
 
 ## Configuration
 
@@ -337,9 +351,9 @@ dependencies:
 | `paths.*` | cache, logs, builds, packages directories |
 | `kernel.localversion` | optional suffix appended to the kernel release (default: empty) |
 | `kernel.reuse_downloads` | skip re-download when tarball/tree exists |
-| `kernel.verify_checksum` / `kernel.verify_signature` | tarball SHA256 and optional GPG (`gpg` required) |
+| `kernel.verify_checksum` / `kernel.verify_signature` | fail-closed tarball SHA256 and optional GPG over the uncompressed tar stream (`gpg` required) |
 | `kernel.include_beta` / `kernel.include_rc` | filter kernel.org version list |
-| `build.jobs` | parallel make jobs (`null` = CPU count; must be a positive integer when set) |
+| `build.jobs` | parallel make jobs (`null` = CPUs available to this process/its container; must be positive when set) |
 | `build.target` | `bindeb-pkg` or `deb-pkg` |
 | `build.use_ccache` | enable ccache via `/usr/lib/ccache` when available (default: true) |
 | `build.use_llvm` / `build.localmodconfig` | LLVM build; module trimming |
@@ -364,10 +378,12 @@ GETKERNEL_NO_ELEVATE=1 getkernel check    # testing only
 ## Limitations & warnings
 
 - No cross-compilation support; native toolchain only.
+- kernel.org metadata is cached for 15 minutes and stale cache data is used if the network is temporarily unavailable. Source checksum verification still fails closed when enabled.
+- Some generated mainline/RC git snapshots in the [kernel.org releases API](https://www.kernel.org/releases.json) do not publish a SHA256 entry or detached tarball signature. With verification enabled GetKernel rejects them before downloading; choose a signed stable/LTS release, or explicitly disable only the unavailable check after accepting the reduced assurance.
 - GetKernel keeps module support/exported symbols enabled, requires a matching `linux-headers` package, and verifies `/lib/modules/<release>/build`. This avoids tool-created VMware/DKMS build failures; vendor sources can still be incompatible with a new **RC/mainline** kernel API.
 - Generated **`linux-libc-dev`** and debug packages are archived but are not installed automatically, avoiding an unrelated replacement of distribution user-space headers.
 - **Secure Boot** may require extra steps for unsigned modules.
-- **Back up** and know how to boot a previous kernel before installing. Use `getkernel backups` and `rollback` for boot-file recovery.
+- **Back up** and know how to boot a previous kernel before installing. `getkernel rollback` restores GetKernel's `/boot` file snapshot; it is not a full package/filesystem rollback.
 
 GetKernel modifies packages, `/boot`, initramfs, and GRUB. Use at your own risk; authors provide **no warranty**. See [SECURITY.md](SECURITY.md) for disclosures.
 
@@ -376,8 +392,13 @@ GetKernel modifies packages, `/boot`, initramfs, and GRUB. Use at your own risk;
 ```bash
 pip install -e ".[dev]"
 pytest
+ruff check .
+python3 -m compileall -q GetKernel.py modules utils tests
+bash -n install.sh uninstall.sh
 GETKERNEL_NO_ELEVATE=1 python3 GetKernel.py list --json
 ```
+
+CI runs the test suite and Ruff on Python 3.8 and 3.12. Network, package installation, `/boot`, initramfs, and GRUB operations remain mocked or excluded from unit tests; perform an end-to-end install test only in a disposable or well-backed-up Debian-based VM.
 
 Contributions: [CONTRIBUTING.md](CONTRIBUTING.md)
 

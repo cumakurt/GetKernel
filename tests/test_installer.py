@@ -56,13 +56,59 @@ class TestInstaller(unittest.TestCase):
                 encoding="utf-8",
             )
             inst = Installer()
-            with patch.object(Installer, "BACKUP_DIR", backup_root):
+            inst.backup_dir = backup_root
+            with patch("modules.installer.is_root", return_value=True):
                 self.assertFalse(inst.rollback(bid))
 
     def test_remove_old_kernels_rejects_negative_keep(self) -> None:
         inst = Installer()
         with self.assertRaises(ValueError):
             inst.remove_old_kernels(keep_count=-1)
+
+    def test_find_linux_packages_matches_exact_release_only(self) -> None:
+        output = "\n".join(
+            (
+                "linux-image-6.1.0",
+                "linux-headers-6.1.0",
+                "linux-modules-6.1.0",
+                "linux-image-6.10.0",
+                "linux-headers-6.1.0-other",
+                "linux-image-6.1.0-dbg",
+            )
+        )
+        with patch("modules.installer.run_cmd") as command:
+            command.return_value = subprocess.CompletedProcess(
+                ["dpkg-query"], 0, output, ""
+            )
+            packages = Installer().find_linux_packages("6.1.0")
+        self.assertEqual(
+            packages,
+            [
+                "linux-headers-6.1.0",
+                "linux-image-6.1.0",
+                "linux-image-6.1.0-dbg",
+                "linux-modules-6.1.0",
+            ],
+        )
+
+    def test_invalid_backup_manifest_is_ignored_when_listing(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            backup_root = Path(td)
+            broken = backup_root / "backup-20260707-120000"
+            broken.mkdir()
+            (broken / "manifest.json").write_text("{broken", encoding="utf-8")
+            inst = Installer()
+            inst.backup_dir = backup_root
+            self.assertEqual(inst.list_backups(), [])
+
+    def test_package_state_verification_detects_removed_package(self) -> None:
+        with patch.object(Installer, "_package_name", return_value="linux-image-6.1.0"):
+            with patch("modules.installer.run_cmd") as command:
+                command.return_value = subprocess.CompletedProcess(
+                    ["dpkg-query"], 1, "", "package is not installed"
+                )
+                issues = Installer._verify_package_states([Path("kernel.deb")])
+        self.assertTrue(any("not installed" in issue for issue in issues))
 
 
 if __name__ == "__main__":

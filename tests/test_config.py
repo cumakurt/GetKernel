@@ -5,9 +5,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from utils.exceptions import ConfigError
-
 from modules.config_manager import ConfigManager
+from utils.exceptions import ConfigError
 
 
 class TestConfigManager(unittest.TestCase):

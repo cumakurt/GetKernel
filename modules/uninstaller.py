@@ -9,8 +9,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 from utils.constants import GETKERNEL_INSTALL_DIR, GETKERNEL_INSTALL_MARKER
-from utils.helpers import is_root, sudo_prefix
-
+from utils.helpers import is_root
 
 MARKER_BEGIN = "# >>> GetKernel PATH (added by install.sh)"
 MARKER_END = "# <<< GetKernel PATH"
@@ -26,16 +25,35 @@ def _is_getkernel_symlink(path: Path) -> bool:
     return target.endswith("/.venv/bin/getkernel") or target.endswith(".venv/bin/getkernel")
 
 
+def _is_getkernel_regular_launcher(path: Path) -> bool:
+    """Recognise legacy wrappers without deleting an unrelated same-name binary."""
+    if not path.is_file() or path.is_symlink():
+        return False
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")[:16384]
+    except OSError:
+        return False
+    return "GetKernel.py" in text or (
+        "getkernel" in text.lower() and "/usr/local/getkernel" in text
+    )
+
+
 def detect_remnants() -> Tuple[List[Path], List[Path]]:
     paths: List[Path] = []
     rc_files: List[Path] = []
     install_dir = GETKERNEL_INSTALL_DIR
-    if install_dir.exists():
+    if install_dir.is_dir() and (
+        (install_dir / GETKERNEL_INSTALL_MARKER).is_file()
+        or (install_dir / "GetKernel.py").is_file()
+    ):
         paths.append(install_dir)
     for candidate in (Path("/usr/local/bin/getkernel"), Path("/usr/bin/getkernel")):
-        if candidate.exists() and (candidate.is_symlink() or candidate.is_file()):
+        if candidate.exists() or candidate.is_symlink():
             if candidate.is_symlink() and not _is_getkernel_symlink(candidate):
                 continue
+            if candidate.is_file() and not candidate.is_symlink():
+                if not _is_getkernel_regular_launcher(candidate):
+                    continue
             paths.append(candidate)
     home_roots = [Path("/root")]
     homes = Path("/home")
@@ -83,8 +101,8 @@ def _strip_path_snippet(rc_file: Path) -> None:
 
 def uninstall_getkernel() -> List[str]:
     """Remove install tree, symlinks, and PATH snippets. Returns removed paths."""
-    if not is_root() and not sudo_prefix():
-        raise PermissionError("Root or sudo required to uninstall GetKernel.")
+    if not is_root():
+        raise PermissionError("Root required to uninstall GetKernel (run with sudo).")
 
     paths, rc_files = detect_remnants()
     if not paths and not rc_files:

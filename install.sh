@@ -181,6 +181,9 @@ _install_dir_from_symlink() {
   if [[ "$target" == *"/.venv/bin/getkernel" ]]; then
     root="${target%/.venv/bin/getkernel}"
     [[ -n "$root" ]] || return 1
+    # A matching suffix alone is not proof of ownership. Never offer an
+    # arbitrary project directory for recursive legacy cleanup.
+    [[ -f "$root/.getkernel_install" || -f "$root/GetKernel.py" ]] || return 1
     printf '%s\n' "$root"
     return 0
   fi

@@ -16,6 +16,9 @@ kernel:
   localversion: ""
   include_beta: true
   include_rc: true
+  # Fail closed when a SHA256 entry is unavailable. Some generated mainline/RC
+  # git snapshots do not publish one; explicitly set false to accept HTTPS +
+  # archive validation for those snapshots.
   verify_checksum: true
   verify_signature: false
   # If true, skip HTTP download when linux-{version}/ or the tarball already exists under build_root.

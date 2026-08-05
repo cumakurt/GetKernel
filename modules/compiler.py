@@ -5,12 +5,14 @@ from __future__ import annotations
 import multiprocessing
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Mapping, Optional
+from typing import Callable, Deque, Dict, List, Mapping, Optional
 
 from utils.constants import COMPILATION_ERROR_HINTS
 from utils.exceptions import CompilationError
@@ -18,6 +20,8 @@ from utils.helpers import project_root, run_cmd
 from utils.validator import validate_kernel_release, validate_localversion
 
 BUILD_TIMEOUT_SEC = 86400
+PROGRESS_UPDATE_INTERVAL_SEC = 0.1
+BUILD_LOG_TAIL_LINES = 500
 
 PHASE_LABELS = {
     "starting": "Starting build",
@@ -136,11 +140,20 @@ class Compiler:
 
     def __init__(self, kernel_source_dir: str) -> None:
         self.source_dir = Path(kernel_source_dir)
-        self.cpu_count = multiprocessing.cpu_count() or 4
+        try:
+            # Honour container/cgroup CPU affinity instead of over-subscribing
+            # every host CPU visible through multiprocessing.cpu_count().
+            self.cpu_count = len(os.sched_getaffinity(0)) or 1
+        except (AttributeError, OSError):
+            self.cpu_count = multiprocessing.cpu_count() or 1
         self.compilation_start_time: Optional[float] = None
         self.estimated_duration: Optional[float] = None
-        self._log_lines: List[str] = []
+        # The complete output is always streamed to last_build_log_path. Keeping
+        # only a diagnostic tail prevents multi-hour builds from consuming RAM
+        # proportional to make's output volume.
+        self._log_lines: Deque[str] = deque(maxlen=BUILD_LOG_TAIL_LINES)
         self._progress_helper: Optional[CompilationProgress] = None
+        self._last_progress_emit = 0.0
         self.build_id: Optional[str] = None
         self.last_build_log_path: Optional[Path] = None
         self._ccache_env: Dict[str, str] = {}
@@ -175,16 +188,15 @@ class Compiler:
         env.setdefault("TERM", "xterm")
         env["LOCALVERSION"] = local_version
         for target in ("olddefconfig", "prepare"):
-            cp = subprocess.run(
+            cp = run_cmd(
                 ["make", target],
                 cwd=self.source_dir,
                 env=env,
-                capture_output=True,
-                text=True,
                 timeout=3600,
             )
             if cp.returncode != 0:
-                raise CompilationError(f"make {target} failed:\n{cp.stderr[-4000:]}")
+                output = (cp.stderr or cp.stdout or "")[-4000:]
+                raise CompilationError(f"make {target} failed:\n{output}")
         return True
 
     def get_kernel_release(self, local_version: str = "") -> str:
@@ -228,8 +240,36 @@ class Compiler:
             print(line, end="")
         if self._progress_helper:
             self._progress_helper.update(line)
-            if progress_callback:
+            now = time.monotonic()
+            if (
+                progress_callback
+                and now - self._last_progress_emit >= PROGRESS_UPDATE_INTERVAL_SEC
+            ):
                 progress_callback(self._progress_helper.snapshot())
+                self._last_progress_emit = now
+
+    @staticmethod
+    def _terminate_process(proc: subprocess.Popen) -> None:
+        """Stop make and its compiler children so cancellation leaves no orphan build."""
+        if proc.poll() is not None:
+            return
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (AttributeError, ProcessLookupError, PermissionError):
+            proc.terminate()
+        try:
+            proc.wait(timeout=10)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (AttributeError, ProcessLookupError, PermissionError):
+            proc.kill()
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            pass
 
     def compile_kernel(
         self,
@@ -288,56 +328,64 @@ class Compiler:
 
         if progress_callback and self._progress_helper:
             progress_callback(self._progress_helper.snapshot())
+            self._last_progress_emit = time.monotonic()
 
         cmd = ["make", f"-j{j}", make_target]
-        proc = subprocess.Popen(
-            cmd,
-            cwd=self.source_dir,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        self._log_lines = []
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=self.source_dir,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            raise CompilationError(f"Cannot start kernel build: {exc}") from exc
+        self._log_lines.clear()
         line_count = 0
-        deadline = (self.compilation_start_time or time.time()) + BUILD_TIMEOUT_SEC
-        if proc.stdout:
-            with open(log_file, "w", encoding="utf-8") as lf:
-                while True:
-                    if time.time() >= deadline:
-                        proc.kill()
-                        proc.wait(timeout=30)
-                        raise CompilationError(
-                            f"Build timed out after {BUILD_TIMEOUT_SEC // 3600} hours"
-                        )
-                    if proc.poll() is not None:
-                        for line in proc.stdout:
-                            self._append_build_line(
-                                line,
-                                lf,
-                                verbose,
-                                progress_callback,
+        deadline = time.monotonic() + BUILD_TIMEOUT_SEC
+        try:
+            if proc.stdout:
+                with open(log_file, "w", encoding="utf-8", buffering=1) as lf:
+                    while True:
+                        if time.monotonic() >= deadline:
+                            self._terminate_process(proc)
+                            raise CompilationError(
+                                f"Build timed out after {BUILD_TIMEOUT_SEC // 3600} hours"
                             )
-                            line_count += 1
-                        break
-                    import select
-
-                    ready, _, _ = select.select([proc.stdout], [], [], 1.0)
-                    if not ready:
-                        continue
-                    line = proc.stdout.readline()
-                    if not line:
                         if proc.poll() is not None:
+                            for line in proc.stdout:
+                                self._append_build_line(
+                                    line,
+                                    lf,
+                                    verbose,
+                                    progress_callback,
+                                )
+                                line_count += 1
                             break
-                        continue
-                    self._append_build_line(line, lf, verbose, progress_callback)
-                    line_count += 1
+                        import select
+
+                        ready, _, _ = select.select([proc.stdout], [], [], 1.0)
+                        if not ready:
+                            continue
+                        line = proc.stdout.readline()
+                        if not line:
+                            if proc.poll() is not None:
+                                break
+                            continue
+                        self._append_build_line(line, lf, verbose, progress_callback)
+                        line_count += 1
+        except BaseException:
+            self._terminate_process(proc)
+            raise
         try:
             rc = proc.wait(timeout=60)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            rc = proc.wait(timeout=30)
+            self._terminate_process(proc)
+            rc = proc.returncode if proc.returncode is not None else -1
         elapsed = time.time() - (self.compilation_start_time or time.time())
         self.estimated_duration = elapsed
 
@@ -354,8 +402,9 @@ class Compiler:
             print(summary, file=sys.stderr)
 
         if rc != 0:
-            tail = "".join(self._log_lines[-80:])
-            full_for_hint = "".join(self._log_lines[-400:])
+            retained_lines = list(self._log_lines)
+            tail = "".join(retained_lines[-80:])
+            full_for_hint = "".join(retained_lines[-400:])
             hint = self.handle_compilation_error(full_for_hint)
             bid = f" [build_id={build_id}]" if build_id else ""
             msg = (
@@ -368,12 +417,10 @@ class Compiler:
 
     def compile_modules(self) -> bool:
         env = os.environ.copy()
-        cp = subprocess.run(
+        cp = run_cmd(
             ["make", f"-j{self.cpu_count}", "modules"],
             cwd=self.source_dir,
             env=env,
-            capture_output=True,
-            text=True,
             timeout=86400,
         )
         return cp.returncode == 0

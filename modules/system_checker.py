@@ -39,15 +39,21 @@ class SystemChecker:
     """Check Debian-based host and resources."""
 
     MIN_REQUIREMENTS = {
-        "disk_gb": 20,
-        "ram_gb": 4,
         "python_version": "3.8",
         "gcc_version": "9.0",
     }
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        min_disk_gb: int = 20,
+        min_ram_gb: int = 4,
+        disk_path: Optional[str] = None,
+    ) -> None:
+        self.min_disk_gb = max(1, int(min_disk_gb))
+        self.min_ram_gb = max(1, int(min_ram_gb))
+        self.disk_path = disk_path
         self.os_info = self._detect_os()
-        self.hardware_info = self._detect_hardware()
 
     def is_debian_based(self) -> bool:
         if os.path.isfile("/etc/debian_version"):
@@ -66,7 +72,7 @@ class SystemChecker:
         self, required_gb: int = 20, path: str | None = None
     ) -> Tuple[bool, float]:
         root = project_root()
-        check = path or str(root / "data" / "builds")
+        check = path or self.disk_path or str(root / "data" / "builds")
         p = check
         while p and not os.path.isdir(p):
             p = os.path.dirname(p)
@@ -196,8 +202,8 @@ class SystemChecker:
             m = run_cmd(["make", "--version"])
             if m.returncode == 0:
                 make_v = m.stdout.splitlines()[0][:80]
-        disk_ok, disk_free = self.check_disk_space()
-        mem_ok, ram_gb, swap_gb = self.check_memory()
+        disk_ok, disk_free = self.check_disk_space(self.min_disk_gb)
+        mem_ok, ram_gb, swap_gb = self.check_memory(self.min_ram_gb)
         return {
             "os": {
                 "name": self.os_info.get("name", ""),
@@ -217,11 +223,14 @@ class SystemChecker:
             "compiler": {"gcc": gcc_ver, "gcc_ok": gcc_ok, "make": make_v},
         }
 
-    def validate_environment(self) -> ValidationResult:
+    def validate_environment(
+        self,
+        system_info: Optional[Dict[str, Any]] = None,
+    ) -> ValidationResult:
         errors: List[str] = []
         warnings: List[str] = []
         rec: List[str] = []
-        info = self.get_system_info()
+        info = system_info or self.get_system_info()
 
         if not self.is_debian_based():
             errors.append("This host does not appear to be Debian-based.")
@@ -229,21 +238,28 @@ class SystemChecker:
         if not self.check_root_privileges():
             errors.append("Root or sudo is required for installs and builds in system paths.")
 
-        disk_ok, free = self.check_disk_space(int(str(self.MIN_REQUIREMENTS["disk_gb"])))
+        disk = info.get("hardware", {}).get("disk", {})
+        disk_ok = bool(disk.get("ok"))
+        free = float(disk.get("free_gb") or 0.0)
         if not disk_ok:
             errors.append(
                 f"Insufficient disk space: {free:.1f} GB free; "
-                f"{self.MIN_REQUIREMENTS['disk_gb']} GB recommended."
+                f"{self.min_disk_gb} GB required."
             )
 
-        mem_ok, ram_gb, swap_gb = self.check_memory(int(str(self.MIN_REQUIREMENTS["ram_gb"])))
+        memory = info.get("hardware", {}).get("memory", {})
+        mem_ok = bool(memory.get("ram_ok"))
+        ram_gb = float(memory.get("ram_gb") or 0.0)
+        swap_gb = float(memory.get("swap_gb") or 0.0)
         if not mem_ok:
             warnings.append(
                 f"Low RAM ({ram_gb:.1f} GB); swap {swap_gb:.1f} GB — build may be slow or fail."
             )
             rec.append("Close other apps or add swap before compiling.")
 
-        gcc_ok, gcc_ver = self.check_compiler_version()
+        compiler = info.get("compiler", {})
+        gcc_ok = bool(compiler.get("gcc_ok"))
+        gcc_ver = str(compiler.get("gcc") or "")
         if not gcc_ok and gcc_ver:
             warnings.append(f"GCC {gcc_ver} may be older than recommended.")
 
@@ -283,7 +299,3 @@ class SystemChecker:
                     out[k.strip().lower()] = v
             break
         return out
-
-    def _detect_hardware(self) -> Dict[str, Any]:
-        return {"cpu": self.get_cpu_info()}
-

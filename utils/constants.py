@@ -58,6 +58,7 @@ REQUIRED_PACKAGES = [
     "dwarves",
     "libdw-dev",
     "rsync",
+    "xz-utils",
     "dpkg-dev",
     "debhelper",
     "fakeroot",

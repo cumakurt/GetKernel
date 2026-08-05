@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
+import lzma
+import os
+import shutil
+import subprocess
 import sys
 import tarfile
+import tempfile
+import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 from urllib.parse import urlparse
@@ -19,12 +27,15 @@ from utils.constants import (
     KERNEL_ORG_RELEASES_JSON,
 )
 from utils.exceptions import DownloadError, VerificationError
-from utils.helpers import cdn_source_url, kernel_major_branch, project_root, run_cmd
-from utils.validator import safe_extract_path, safe_extract_tarball
+from utils.helpers import cdn_source_url, kernel_major_branch, project_root
+from utils.validator import safe_extract_tarball
 
 
 class KernelFetcher:
     """Download metadata and kernel tarballs from kernel.org."""
+
+    RELEASE_CACHE_TTL_SEC = 15 * 60
+    RELEASE_CACHE_MAX_BYTES = 5 * 1024 * 1024
 
     def __init__(self, cache_dir: Optional[str] = None):
         root = project_root()
@@ -68,14 +79,21 @@ class KernelFetcher:
     ) -> Dict[str, Any]:
         ib = self.include_beta if include_beta is None else include_beta
         ir = self.include_rc if include_rc is None else include_rc
-        try:
-            r = self.session.get(self.releases_api, timeout=60)
-            r.raise_for_status()
-            data = r.json()
-        except (requests.RequestException, json.JSONDecodeError) as exc:
-            raise DownloadError(f"Failed to fetch releases.json: {exc}") from exc
+        data = self._read_release_cache(max_age=self.RELEASE_CACHE_TTL_SEC)
+        if data is None:
+            try:
+                r = self.session.get(self.releases_api, timeout=60)
+                r.raise_for_status()
+                parsed = r.json()
+                if not self._is_release_payload(parsed):
+                    raise ValueError("response does not contain kernel release data")
+                data = parsed
+                self._write_release_cache(data)
+            except (requests.RequestException, json.JSONDecodeError, ValueError) as exc:
+                data = self._read_release_cache(max_age=None)
+                if data is None:
+                    raise DownloadError(f"Failed to fetch releases.json: {exc}") from exc
 
-        self._releases_cache = data
         versions: List[Dict[str, Any]] = []
         longterm_list: List[str] = []
         stable_ver = ""
@@ -121,7 +139,10 @@ class KernelFetcher:
                         "moniker": moniker,
                         "released": rel,
                         "source_url": source_url,
-                        "pgp_url": (source_url + ".sign") if source_url.endswith(".xz") else "",
+                        "pgp_url": self._signature_url(
+                            source_url,
+                            str(item.get("pgp") or ""),
+                        ),
                         "sha256_url": self._sha256sums_url(ver),
                     }
                 )
@@ -152,7 +173,7 @@ class KernelFetcher:
                         "moniker": moniker,
                         "released": released,
                         "source_url": source_url,
-                        "pgp_url": source_url + ".sign" if source_url.endswith(".xz") else "",
+                        "pgp_url": self._signature_url(source_url),
                         "sha256_url": self._sha256sums_url(ver),
                     }
                 )
@@ -192,12 +213,60 @@ class KernelFetcher:
             seen.add(ver)
             uniq.append(v)
 
-        return {
+        normalized = {
             "stable": stable_ver or "",
             "mainline": mainline_ver or "",
             "longterm": [x for x in longterm_list if x],
             "versions": uniq,
         }
+        # Helpers consume the normalized public shape, not kernel.org's raw
+        # schema (which uses latest_stable instead of stable).
+        self._releases_cache = normalized
+        return normalized
+
+    @property
+    def _release_cache_path(self) -> Path:
+        return self.cache_dir / "releases.json"
+
+    @staticmethod
+    def _is_release_payload(data: Any) -> bool:
+        if not isinstance(data, dict):
+            return False
+        if isinstance(data.get("releases"), list):
+            return True
+        return any(key in data for key in ("stable", "mainline", "longterm"))
+
+    def _read_release_cache(self, *, max_age: Optional[float]) -> Optional[Dict[str, Any]]:
+        path = self._release_cache_path
+        try:
+            stat = path.stat()
+            if stat.st_size > self.RELEASE_CACHE_MAX_BYTES:
+                return None
+            if max_age is not None and time.time() - stat.st_mtime > max_age:
+                return None
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            return None
+        return data if self._is_release_payload(data) else None
+
+    def _write_release_cache(self, data: Dict[str, Any]) -> None:
+        temp_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                dir=self.cache_dir,
+                prefix=".releases-",
+                encoding="utf-8",
+                delete=False,
+            ) as temp:
+                json.dump(data, temp)
+                temp.flush()
+                os.fsync(temp.fileno())
+                temp_path = Path(temp.name)
+            temp_path.replace(self._release_cache_path)
+        except OSError:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
 
     def _pick_version(self, node: Any) -> str:
         if isinstance(node, dict):
@@ -217,9 +286,21 @@ class KernelFetcher:
     def _source_url_from_release(self, node: Any, version: str) -> str:
         if isinstance(node, dict):
             src = node.get("source")
-            if isinstance(src, str) and src.startswith("http"):
+            if isinstance(src, str) and src.startswith("https://"):
                 return src
         return cdn_source_url(version, self.cdn_url)
+
+    @staticmethod
+    def _signature_url(source_url: str, explicit_url: str = "") -> str:
+        if explicit_url.startswith("https://"):
+            return explicit_url
+        parsed = urlparse(source_url)
+        if (
+            parsed.hostname in {"cdn.kernel.org", "mirrors.edge.kernel.org", "www.kernel.org"}
+            and source_url.endswith((".tar.xz", ".tar.gz"))
+        ):
+            return source_url.rsplit(".", 1)[0] + ".sign"
+        return ""
 
     def _sha256sums_url(self, version: str) -> str:
         branch = kernel_major_branch(version)
@@ -244,7 +325,14 @@ class KernelFetcher:
 
     @staticmethod
     def is_kernel_source_tree(path: Path) -> bool:
-        return path.is_dir() and (path / "Makefile").is_file()
+        return all(
+            (
+                path.is_dir(),
+                (path / "Makefile").is_file(),
+                (path / "Kconfig").is_file(),
+                (path / "scripts" / "kconfig").is_dir(),
+            )
+        )
 
     def download_kernel_source(
         self,
@@ -261,6 +349,16 @@ class KernelFetcher:
             ``reuse_tarball``, ``resume`` (continued partial download), or ``fresh``.
         """
         do_verify_sig = verify_signature and self.verify_signature_enabled
+        parent = Path(target_dir) if target_dir else project_root() / "data" / "builds"
+        parent.mkdir(parents=True, exist_ok=True)
+        extract_dir = self.expected_source_directory(parent, version)
+
+        # A complete local tree needs no metadata lookup. Repeat builds are
+        # therefore instant and remain usable while offline.
+        if reuse_existing and self.is_kernel_source_tree(extract_dir):
+            self._download_progress = 100.0
+            return str(extract_dir), "reuse_tree"
+
         meta = self.fetch_kernel_versions()
         url = ""
         pgp_url = ""
@@ -271,23 +369,23 @@ class KernelFetcher:
                 break
         if not url:
             url = cdn_source_url(version, self.cdn_url)
-        if not pgp_url and url.endswith(".xz"):
-            pgp_url = url + ".sign"
+        if not pgp_url:
+            pgp_url = self._signature_url(url)
+        if do_verify_sig and not pgp_url:
+            raise VerificationError(
+                f"No detached PGP signature is published for linux-{version}. "
+                "Choose a signed stable/LTS release or disable signature verification."
+            )
 
-        parent = Path(target_dir) if target_dir else project_root() / "data" / "builds"
-        parent.mkdir(parents=True, exist_ok=True)
         fname = Path(urlparse(url).path).name
         if not fname or fname.endswith("/"):
             fname = f"linux-{version}.tar.xz"
         tarball = parent / fname
-        extract_dir = self.expected_source_directory(parent, version)
-
-        if reuse_existing and self.is_kernel_source_tree(extract_dir):
-            self._download_progress = 100.0
-            return str(extract_dir), "reuse_tree"
-
         expected_hash = self._fetch_sha256_for_tarball(version, tarball.name)
-        remote_size = self._head_content_length(url)
+        self._assert_checksum_available(expected_hash, tarball.name)
+        remote_size = None
+        if reuse_existing and tarball.is_file():
+            remote_size = self._head_content_length(url)
         resume_from = 0
         need_download = True
         status = "fresh"
@@ -308,8 +406,11 @@ class KernelFetcher:
                 status = "fresh"
 
         if need_download:
-            self._download_from_mirrors(version, url, tarball, start_byte=resume_from)
-            expected_hash = self._fetch_sha256_for_tarball(version, tarball.name)
+            used_offset = self._download_from_mirrors(
+                version, url, tarball, start_byte=resume_from
+            )
+            if used_offset == 0 and resume_from > 0:
+                status = "fresh"
             self._assert_tarball_integrity(tarball, expected_hash)
             if do_verify_sig and pgp_url:
                 self._verify_gpg_signature(tarball, pgp_url)
@@ -324,6 +425,11 @@ class KernelFetcher:
         if self.is_kernel_source_tree(extract_dir):
             return str(extract_dir), status
         extracted = self.extract_tarball(str(tarball), str(extract_root))
+        if not self.is_kernel_source_tree(Path(extracted)):
+            raise DownloadError(
+                "Extracted archive is not a complete kernel source tree "
+                "(missing Makefile, Kconfig, or scripts/kconfig)."
+            )
         return extracted, status
 
     def _classify_tarball(
@@ -376,7 +482,10 @@ class KernelFetcher:
             else:
                 mode = "r:xz"
             with tarfile.open(path, mode) as tf:  # type: ignore[arg-type]
-                if not tf.getnames():
+                found = False
+                for _member in tf:
+                    found = True
+                if not found:
                     return False
             return True
         except (tarfile.TarError, OSError):
@@ -402,10 +511,16 @@ class KernelFetcher:
             return None
         for line in r.text.splitlines():
             parts = line.split()
-            if len(parts) >= 2 and filename in parts[-1]:
-                return parts[0].lower()
-            if len(parts) >= 2 and parts[1].endswith(filename):
-                return parts[0].lower()
+            if len(parts) < 2:
+                continue
+            digest = parts[0].lower()
+            listed_name = parts[-1].lstrip("*")
+            if (
+                Path(listed_name).name == filename
+                and len(digest) == 64
+                and all(c in "0123456789abcdef" for c in digest)
+            ):
+                return digest
         return None
 
     def _assert_tarball_integrity(
@@ -413,12 +528,33 @@ class KernelFetcher:
         tarball: Path,
         expected_hash: Optional[str],
     ) -> None:
-        if not self.verify_checksum_enabled or not expected_hash:
+        if not self.verify_checksum_enabled:
             return
+        self._assert_checksum_available(expected_hash, tarball.name)
         if not self.verify_checksum(str(tarball), expected_hash):
             raise VerificationError("SHA256 checksum mismatch for kernel tarball")
 
+    def _assert_checksum_available(
+        self,
+        expected_hash: Optional[str],
+        filename: str,
+    ) -> None:
+        if self.verify_checksum_enabled and not expected_hash:
+            raise VerificationError(
+                f"Checksum verification is enabled, but kernel.org did not provide "
+                f"a SHA256 entry for {filename}. This is common for generated "
+                "mainline/RC snapshots. Set kernel.verify_checksum: false only "
+                "if HTTPS transport plus archive validation is acceptable."
+            )
+
     def _mirror_urls(self, version: str, primary_url: str) -> List[str]:
+        canonical_name = Path(urlparse(cdn_source_url(version, self.cdn_url)).path).name
+        primary_name = Path(urlparse(primary_url).path).name if primary_url else ""
+        if primary_url and primary_name != canonical_name:
+            # kernel.org mainline metadata can point to a generated .tar.gz
+            # git snapshot. A CDN .tar.xz is not a byte-identical mirror and
+            # must never be written under the snapshot filename.
+            return [primary_url]
         urls: List[str] = []
         for mirror in CDN_MIRRORS:
             candidate = cdn_source_url(version, mirror)
@@ -435,16 +571,28 @@ class KernelFetcher:
         dest: Path,
         *,
         start_byte: int = 0,
-    ) -> None:
+    ) -> int:
+        """Try mirrors safely, then retry a failed resume as a fresh download."""
         errors: List[str] = []
-        for url in self._mirror_urls(version, primary_url):
-            try:
-                self._download_file(url, dest, start_byte=start_byte)
-                return
-            except DownloadError as exc:
-                errors.append(f"{url}: {exc}")
-                if dest.is_file() and start_byte == 0:
-                    dest.unlink(missing_ok=True)
+        offsets = [start_byte]
+        if start_byte > 0:
+            offsets.append(0)
+        for offset in offsets:
+            for url in self._mirror_urls(version, primary_url):
+                try:
+                    # A failed mirror may have written bytes. Restore the exact
+                    # starting state before trying another one; otherwise the
+                    # next response would be appended after a corrupt tail.
+                    if dest.is_file():
+                        if offset == 0:
+                            dest.unlink(missing_ok=True)
+                        else:
+                            with open(dest, "r+b") as partial:
+                                partial.truncate(offset)
+                    return self._download_file(url, dest, start_byte=offset)
+                except (DownloadError, OSError) as exc:
+                    mode = "resume" if offset else "fresh"
+                    errors.append(f"{url} ({mode}): {exc}")
         raise DownloadError(
             "Download failed on all CDN mirrors:\n" + "\n".join(errors)
         )
@@ -455,14 +603,38 @@ class KernelFetcher:
             resp = self.session.get(sign_url, timeout=120)
             resp.raise_for_status()
             sign_path.write_bytes(resp.content)
-        except requests.RequestException as exc:
+        except (requests.RequestException, OSError) as exc:
             raise VerificationError(f"Failed to download signature: {exc}") from exc
-        cp = run_cmd(["gpg", "--verify", str(sign_path), str(tarball)])
-        if cp.returncode != 0:
-            detail = (cp.stderr or cp.stdout or "").strip()
+        # kernel.org signs the uncompressed .tar stream so the same signature
+        # works for xz/gz variants. Feed decompressed bytes to gpg without
+        # materialising another multi-gigabyte file.
+        opener = gzip.open if tarball.name.endswith(".gz") else lzma.open
+        try:
+            proc = subprocess.Popen(
+                ["gpg", "--verify", str(sign_path), "-"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except OSError as exc:
+            raise VerificationError(f"Cannot start gpg: {exc}") from exc
+        try:
+            assert proc.stdin is not None
+            with opener(tarball, "rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    proc.stdin.write(chunk)
+            proc.stdin.close()
+            proc.stdin = None
+            stdout, stderr = proc.communicate(timeout=600)
+        except (OSError, EOFError, lzma.LZMAError, subprocess.TimeoutExpired) as exc:
+            proc.kill()
+            proc.communicate()
+            raise VerificationError(f"GPG verification could not complete: {exc}") from exc
+        if proc.returncode != 0:
+            detail = (stderr or stdout or b"").decode(errors="replace").strip()
             raise VerificationError(f"GPG verification failed: {detail}")
 
-    def _download_file(self, url: str, dest: Path, start_byte: int = 0) -> None:
+    def _download_file(self, url: str, dest: Path, start_byte: int = 0) -> int:
         if not url.startswith("https://"):
             from utils.exceptions import SecurityError
 
@@ -476,7 +648,7 @@ class KernelFetcher:
             mode = "ab"
             done = start_byte
 
-        self._download_progress = (done / max(done, 1)) * 100.0 if done else 0.0
+        self._download_progress = 0.0
         try:
             with self.session.get(
                 url, stream=True, headers=headers, timeout=600
@@ -493,10 +665,17 @@ class KernelFetcher:
                         start_byte = 0
                     elif resp.status_code != 206:
                         resp.raise_for_status()
+                    else:
+                        content_range = resp.headers.get("Content-Range", "")
+                        if not content_range.startswith(f"bytes {start_byte}-"):
+                            raise DownloadError(
+                                "Resume failed: server returned an unexpected Content-Range."
+                            )
                 else:
                     resp.raise_for_status()
 
-                chunk_total = int(resp.headers.get("Content-Length") or 0)
+                raw_length = resp.headers.get("Content-Length") or "0"
+                chunk_total = int(raw_length) if str(raw_length).isdigit() else 0
                 if start_byte > 0 and resp.status_code == 206:
                     total = start_byte + chunk_total
                 else:
@@ -517,7 +696,7 @@ class KernelFetcher:
                     progress.start()
                 try:
                     with open(dest, mode) as f:
-                        for chunk in resp.iter_content(chunk_size=1024 * 256):
+                        for chunk in resp.iter_content(chunk_size=1024 * 1024):
                             if not chunk:
                                 continue
                             f.write(chunk)
@@ -531,16 +710,27 @@ class KernelFetcher:
                 finally:
                     if use_progress:
                         progress.stop()  # type: ignore[possibly-undefined]
-        except requests.RequestException as exc:
+                if total and done != total:
+                    raise DownloadError(
+                        f"Incomplete download: received {done} of {total} bytes."
+                    )
+        except (requests.RequestException, OSError) as exc:
             raise DownloadError(f"Download failed: {exc}") from exc
         self._download_progress = 100.0
+        # Report the offset actually used. A server may legally ignore Range
+        # and return 200, in which case the file was restarted rather than
+        # resumed and the CLI should say so.
+        return start_byte
 
     def verify_checksum(self, filepath: str, expected_hash: str) -> bool:
         h = hashlib.sha256()
         p = Path(filepath)
-        with open(p, "rb") as f:
-            for chunk in iter(lambda: f.read(65536), b""):
-                h.update(chunk)
+        try:
+            with open(p, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    h.update(chunk)
+        except OSError as exc:
+            raise VerificationError(f"Cannot read tarball for SHA256 verification: {exc}") from exc
         return h.hexdigest().lower() == expected_hash.strip().lower()
 
     def extract_tarball(self, tarball_path: str, target_dir: str) -> str:
@@ -551,19 +741,43 @@ class KernelFetcher:
             mode = "r:gz"
         else:
             mode = "r:xz"
-        with tarfile.open(tarball_path, mode) as tf:  # type: ignore[arg-type]
-            names = tf.getnames()
-            if not names:
-                raise DownloadError("Empty tarball")
-            # Validate all member paths before extraction (path traversal check)
-            for name in names:
-                safe_extract_path(target, name)
-            root_dir = names[0].split("/")[0]
-            try:
-                tf.extractall(path=target, filter="data")
-            except TypeError:
-                safe_extract_tarball(tf, target)
-        out = target / root_dir
+        stage = Path(tempfile.mkdtemp(prefix=".getkernel-extract-", dir=target))
+        previous: Optional[Path] = None
+        out: Optional[Path] = None
+        try:
+            with tarfile.open(tarball_path, mode) as tf:  # type: ignore[arg-type]
+                try:
+                    tf.extractall(path=stage, filter="data")
+                except TypeError:
+                    safe_extract_tarball(tf, stage)
+
+            # Inspect the materialised staging directory instead of scanning
+            # the compressed tar once for layout and then decompressing it a
+            # second time for extraction. Kernel archives are large, so this
+            # removes an entire decompression pass while retaining the single
+            # top-level-directory requirement.
+            top_level = list(stage.iterdir())
+            if len(top_level) != 1 or not top_level[0].is_dir():
+                raise DownloadError(
+                    "Unexpected tarball layout (expected one root directory)"
+                )
+            staged_root = top_level[0]
+            root_dir = staged_root.name
+            out = target / root_dir
+            if out.exists():
+                previous = target / f".{root_dir}.previous-{uuid.uuid4().hex}"
+                out.replace(previous)
+            staged_root.replace(out)
+        except (tarfile.TarError, OSError) as exc:
+            if previous is not None and out is not None and not out.exists():
+                previous.replace(out)
+            raise DownloadError(f"Cannot extract kernel tarball: {exc}") from exc
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+        if previous is not None:
+            shutil.rmtree(previous, ignore_errors=True)
+        if out is None:
+            raise DownloadError("Unexpected tarball layout")
         if not out.is_dir():
             raise DownloadError("Unexpected tarball layout")
         return str(out.resolve())
