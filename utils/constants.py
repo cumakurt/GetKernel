@@ -71,6 +71,20 @@ OPTIONAL_PACKAGES = [
     "libzstd-dev",
 ]
 
+# Files expected in the installed kernel build tree before an out-of-tree
+# module is compiled.  Modern Kbuild can build most modules from auto.conf,
+# but VMware's header validator still requires the original .config as well.
+EXTERNAL_MODULE_HEADER_FILES = (
+    ".config",
+    "Makefile",
+    "Module.symvers",
+    "include/config/auto.conf",
+    "include/generated/autoconf.h",
+    "include/generated/utsrelease.h",
+    "include/generated/uapi/linux/version.h",
+    "scripts/mod/modpost",
+)
+
 COMPILATION_ERROR_HINTS = (
     (
         r"fatal error: openssl/.*\.h: No such file",

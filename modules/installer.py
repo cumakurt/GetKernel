@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from modules.grub_manager import GrubManager
+from utils.constants import EXTERNAL_MODULE_HEADER_FILES
 from utils.exceptions import InstallationError
 from utils.helpers import is_root, run_cmd, sudo_prefix
 from utils.validator import (
@@ -334,9 +335,24 @@ class Installer:
                     f"missing {build_dir} (install matching linux-headers; "
                     "VMware/DKMS modules cannot be built without it)"
                 )
-            elif not (build_dir / "Makefile").is_file():
-                issues.append(f"incomplete kernel headers under {build_dir}")
+            else:
+                missing_headers = self.external_module_header_issues(build_dir)
+                if missing_headers:
+                    issues.append(
+                        f"incomplete kernel headers under {build_dir}: missing "
+                        + ", ".join(missing_headers)
+                        + " (VMware/DKMS modules cannot be built)"
+                    )
         return len(issues) == 0, issues
+
+    @staticmethod
+    def external_module_header_issues(build_dir: Path) -> List[str]:
+        """List missing files required by Kbuild and VMware's header validator."""
+        return [
+            relative
+            for relative in EXTERNAL_MODULE_HEADER_FILES
+            if not (build_dir / relative).is_file()
+        ]
 
     def set_default_kernel(self, kernel_version: str) -> bool:
         return GrubManager().set_default_entry(kernel_version=kernel_version)

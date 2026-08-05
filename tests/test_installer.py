@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from modules.installer import Installer
+from utils.constants import EXTERNAL_MODULE_HEADER_FILES
 
 
 class TestInstaller(unittest.TestCase):
@@ -109,6 +110,23 @@ class TestInstaller(unittest.TestCase):
                 )
                 issues = Installer._verify_package_states([Path("kernel.deb")])
         self.assertTrue(any("not installed" in issue for issue in issues))
+
+    def test_external_module_headers_require_vmware_config(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            build_dir = Path(td)
+            for relative in EXTERNAL_MODULE_HEADER_FILES:
+                if relative == ".config":
+                    continue
+                member = build_dir / relative
+                member.parent.mkdir(parents=True, exist_ok=True)
+                member.write_text("test\n", encoding="utf-8")
+
+            self.assertEqual(
+                Installer.external_module_header_issues(build_dir),
+                [".config"],
+            )
+            (build_dir / ".config").write_text("CONFIG_MODULES=y\n", encoding="utf-8")
+            self.assertEqual(Installer.external_module_header_issues(build_dir), [])
 
 
 if __name__ == "__main__":

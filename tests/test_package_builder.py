@@ -2,6 +2,8 @@
 
 import hashlib
 import json
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,9 +14,49 @@ from modules.package_builder import (
     PackageBuilder,
     find_matching_stored_packages,
 )
+from utils.constants import EXTERNAL_MODULE_HEADER_FILES
 
 
 class TestFindMatchingStored(unittest.TestCase):
+    @staticmethod
+    def _build_headers_deb(root: Path, release: str) -> Path:
+        package_root = root / "package-root"
+        control_dir = package_root / "DEBIAN"
+        control_dir.mkdir(parents=True)
+        (control_dir / "control").write_text(
+            "\n".join(
+                (
+                    f"Package: linux-headers-{release}",
+                    "Version: 1-1",
+                    "Architecture: amd64",
+                    "Maintainer: GetKernel Tests <test@example.invalid>",
+                    "Installed-Size: 1",
+                    "Description: test headers",
+                    "",
+                )
+            ),
+            encoding="utf-8",
+        )
+        header_root = package_root / "usr" / "src" / f"linux-headers-{release}"
+        for relative in EXTERNAL_MODULE_HEADER_FILES:
+            if relative == ".config":
+                continue
+            member = header_root / relative
+            member.parent.mkdir(parents=True, exist_ok=True)
+            member.write_text(f"test {relative}\n", encoding="utf-8")
+        (control_dir / "md5sums").write_text(
+            "d41d8cd98f00b204e9800998ecf8427e  usr/src/unrelated\n",
+            encoding="utf-8",
+        )
+        deb = root / f"linux-headers-{release}_1-1_amd64.deb"
+        subprocess.run(
+            ["dpkg-deb", "--build", str(package_root), str(deb)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return deb
+
     def test_build_info_exact_match(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -223,6 +265,59 @@ class TestFindMatchingStored(unittest.TestCase):
 
             self.assertFalse(ok)
             self.assertTrue(any("missing depot package" in error for error in errors))
+
+    @unittest.skipUnless(shutil.which("dpkg-deb"), "dpkg-deb is required")
+    def test_embed_kernel_config_in_headers_owns_vmware_config(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "source"
+            source.mkdir()
+            config = source / ".config"
+            config.write_text("CONFIG_MODULES=y\n", encoding="utf-8")
+            header_deb = self._build_headers_deb(root, "6.1.0")
+            pb = PackageBuilder(str(source), output_dir=str(root / "out"))
+
+            result = pb.embed_kernel_config_in_headers(
+                [header_deb],
+                expected_kernel_release="6.1.0",
+                config_file=config,
+            )
+
+            self.assertEqual(result, header_deb)
+            extracted = root / "extracted"
+            subprocess.run(
+                ["dpkg-deb", "-R", str(header_deb), str(extracted)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            packaged_config = (
+                extracted / "usr" / "src" / "linux-headers-6.1.0" / ".config"
+            )
+            self.assertEqual(packaged_config.read_bytes(), config.read_bytes())
+            self.assertEqual(packaged_config.stat().st_mode & 0o777, 0o644)
+            md5sums = (extracted / "DEBIAN" / "md5sums").read_text(encoding="utf-8")
+            self.assertIn("usr/src/linux-headers-6.1.0/.config", md5sums)
+            control = (extracted / "DEBIAN" / "control").read_text(encoding="utf-8")
+            self.assertIn("Installed-Size: 2", control)
+
+    @unittest.skipUnless(shutil.which("dpkg-deb"), "dpkg-deb is required")
+    def test_verify_rejects_headers_without_vmware_config(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "source"
+            source.mkdir()
+            header_deb = self._build_headers_deb(root, "6.1.0")
+            pb = PackageBuilder(str(source), output_dir=str(root / "out"))
+
+            ok, errors = pb.verify_packages(
+                [header_deb],
+                expected_kernel_release="6.1.0",
+                require_headers=True,
+            )
+
+            self.assertFalse(ok)
+            self.assertTrue(any("missing .config" in error for error in errors))
 
 
 if __name__ == "__main__":

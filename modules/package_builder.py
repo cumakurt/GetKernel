@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import shutil
 import tempfile
 import uuid
@@ -12,8 +13,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from utils.constants import EXTERNAL_MODULE_HEADER_FILES
 from utils.helpers import project_root, run_cmd
-from utils.validator import canonical_kernel_release
+from utils.validator import canonical_kernel_release, validate_kernel_release
 
 BUILD_INFO_FILENAME = "build-info.json"
 
@@ -167,6 +169,7 @@ class PackageBuilder:
     ) -> Tuple[bool, List[str]]:
         errors: List[str] = []
         package_names: List[str] = []
+        package_paths: Dict[str, Path] = {}
         errors.extend(self._verify_depot_checksums(package_list))
         for deb in package_list:
             try:
@@ -187,6 +190,7 @@ class PackageBuilder:
                 errors.append(f"missing Package metadata: {deb}")
                 continue
             package_names.append(package)
+            package_paths[package] = deb
 
         if expected_kernel_release:
             images = [
@@ -206,15 +210,191 @@ class PackageBuilder:
                 errors.append(f"missing kernel image package for {expected_kernel_release}")
             if mismatched:
                 errors.append("packages from another kernel release: " + ", ".join(mismatched))
-            if require_headers and not any(
-                _is_kernel_headers_package(name, expected_kernel_release)
-                for name in package_names
-            ):
-                errors.append(
-                    f"missing linux-headers package for {expected_kernel_release}; "
-                    "VMware/DKMS modules would not be buildable"
-                )
+            if require_headers:
+                header_name = f"linux-headers-{expected_kernel_release}"
+                header_deb = package_paths.get(header_name)
+                if header_deb is None:
+                    errors.append(
+                        f"missing linux-headers package for {expected_kernel_release}; "
+                        "VMware/DKMS modules would not be buildable"
+                    )
+                else:
+                    members = self._regular_deb_members(header_deb)
+                    if members is None:
+                        errors.append(f"cannot inspect external-module files in {header_deb}")
+                    else:
+                        prefix = f"usr/src/linux-headers-{expected_kernel_release}/"
+                        missing = [
+                            relative
+                            for relative in EXTERNAL_MODULE_HEADER_FILES
+                            if f"{prefix}{relative}" not in members
+                        ]
+                        if missing:
+                            errors.append(
+                                f"incomplete linux-headers package for "
+                                f"{expected_kernel_release}: missing "
+                                + ", ".join(missing)
+                                + "; VMware/DKMS modules would not be buildable"
+                            )
         return len(errors) == 0, errors
+
+    @staticmethod
+    def _regular_deb_members(deb_file: Path) -> Optional[set[str]]:
+        """Return regular data-archive members reported by dpkg-deb."""
+        cp = run_cmd(["dpkg-deb", "-c", str(deb_file)], timeout=300)
+        if cp.returncode != 0:
+            return None
+        members: set[str] = set()
+        for line in cp.stdout.splitlines():
+            if not line.startswith("-"):
+                continue
+            marker = line.find(" ./")
+            if marker < 0:
+                continue
+            member = line[marker + 3 :].strip()
+            if member:
+                members.add(member)
+        return members
+
+    def embed_kernel_config_in_headers(
+        self,
+        package_list: List[Path],
+        *,
+        expected_kernel_release: str,
+        config_file: Path | str,
+    ) -> Path:
+        """Atomically add the build .config to the matching headers DEB.
+
+        Recent upstream ``install-extmod-build`` scripts package auto.conf but
+        omit ``.config``.  That is sufficient for Kbuild, while VMware's
+        proprietary header validator rejects the same otherwise-complete tree.
+        Repacking here keeps the installed workaround owned by the headers
+        package and ensures it survives installation on a newly booted kernel.
+        """
+        if not validate_kernel_release(expected_kernel_release):
+            raise ValueError(f"Invalid kernel release: {expected_kernel_release!r}")
+
+        source_config = Path(config_file).resolve()
+        if not source_config.is_file():
+            raise ValueError(f"Kernel build configuration is missing: {source_config}")
+        try:
+            config_size = source_config.stat().st_size
+        except OSError as exc:
+            raise OSError(f"Cannot read kernel build configuration: {exc}") from exc
+        if config_size <= 0:
+            raise ValueError(f"Kernel build configuration is empty: {source_config}")
+
+        expected_package = f"linux-headers-{expected_kernel_release}"
+        matches: List[Path] = []
+        for package in package_list:
+            info = self.get_package_info(package)
+            if info.get("package") == expected_package:
+                matches.append(package)
+        if len(matches) != 1:
+            raise ValueError(
+                f"Expected exactly one {expected_package} package, found {len(matches)}"
+            )
+
+        header_deb = matches[0]
+        if header_deb.is_symlink() or not header_deb.is_file() or header_deb.suffix != ".deb":
+            raise ValueError(f"Invalid headers package path: {header_deb}")
+
+        prefix = Path("usr") / "src" / expected_package
+        with tempfile.TemporaryDirectory(
+            prefix=".headers-repack-",
+            dir=header_deb.parent,
+        ) as temp_name:
+            temp_dir = Path(temp_name)
+            package_root = temp_dir / "root"
+            package_root.mkdir()
+            extracted = run_cmd(
+                ["dpkg-deb", "-R", str(header_deb), str(package_root)],
+                timeout=900,
+            )
+            if extracted.returncode != 0:
+                detail = (extracted.stderr or extracted.stdout or "unknown error")[-2000:]
+                raise OSError(f"Cannot extract {header_deb.name}: {detail}")
+
+            header_root = package_root / prefix
+            if header_root.is_symlink() or not header_root.is_dir():
+                raise ValueError(
+                    f"Headers package does not contain the expected directory: /{prefix}"
+                )
+            if not (header_root / "Makefile").is_file():
+                raise ValueError(f"Headers package is incomplete under /{prefix}")
+
+            packaged_config = header_root / ".config"
+            if packaged_config.is_symlink() or (
+                packaged_config.exists() and not packaged_config.is_file()
+            ):
+                raise ValueError(f"Unsafe .config entry in {header_deb.name}")
+            old_size = packaged_config.stat().st_size if packaged_config.is_file() else 0
+            shutil.copy2(source_config, packaged_config)
+            os.chmod(packaged_config, 0o644)
+
+            member_name = (prefix / ".config").as_posix()
+            self._update_debian_md5sums(package_root, member_name, packaged_config)
+            self._adjust_installed_size(package_root, old_size, config_size)
+
+            rebuilt = temp_dir / header_deb.name
+            built = run_cmd(
+                ["dpkg-deb", "--build", str(package_root), str(rebuilt)],
+                timeout=900,
+            )
+            if built.returncode != 0 or not rebuilt.is_file():
+                detail = (built.stderr or built.stdout or "unknown error")[-2000:]
+                raise OSError(f"Cannot rebuild {header_deb.name}: {detail}")
+            members = self._regular_deb_members(rebuilt)
+            if members is None or member_name not in members:
+                raise OSError(
+                    f"Rebuilt {header_deb.name} does not contain /{member_name}"
+                )
+            rebuilt.replace(header_deb)
+
+        return header_deb
+
+    @staticmethod
+    def _update_debian_md5sums(
+        package_root: Path,
+        member_name: str,
+        source: Path,
+    ) -> None:
+        """Keep DEBIAN/md5sums consistent when the generated package has one."""
+        md5sums = package_root / "DEBIAN" / "md5sums"
+        if not md5sums.is_file():
+            return
+        lines = md5sums.read_text(encoding="utf-8", errors="strict").splitlines()
+        kept: List[str] = []
+        for line in lines:
+            fields = line.split(maxsplit=1)
+            if len(fields) == 2 and fields[1].lstrip("*") == member_name:
+                continue
+            kept.append(line)
+        # MD5 is required by Debian package metadata; depot integrity uses SHA-256.
+        digest = hashlib.md5(source.read_bytes()).hexdigest()  # noqa: S324
+        kept.append(f"{digest}  {member_name}")
+        md5sums.write_text("\n".join(kept) + "\n", encoding="utf-8")
+
+    @staticmethod
+    def _adjust_installed_size(package_root: Path, old_size: int, new_size: int) -> None:
+        """Account for the embedded config in the package's Installed-Size."""
+        control = package_root / "DEBIAN" / "control"
+        if not control.is_file():
+            return
+        lines = control.read_text(encoding="utf-8", errors="strict").splitlines()
+        old_kib = (old_size + 1023) // 1024
+        new_kib = (new_size + 1023) // 1024
+        for index, line in enumerate(lines):
+            if not line.startswith("Installed-Size:"):
+                continue
+            raw = line.partition(":")[2].strip()
+            try:
+                installed_kib = int(raw)
+            except ValueError:
+                return
+            lines[index] = f"Installed-Size: {max(0, installed_kib - old_kib + new_kib)}"
+            control.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            return
 
     @classmethod
     def _verify_depot_checksums(cls, package_list: List[Path]) -> List[str]:

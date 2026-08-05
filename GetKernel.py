@@ -1003,6 +1003,17 @@ def run_build_flow(
     if not debs:
         click.echo("No .deb files found next to the build directory.", err=True)
         sys.exit(1)
+    try:
+        headers_deb = pb.embed_kernel_config_in_headers(
+            debs,
+            expected_kernel_release=kernel_release,
+            config_file=src / ".config",
+        )
+    except (OSError, ValueError) as exc:
+        raise GetKernelError(
+            f"Cannot make the headers package VMware-compatible: {exc}"
+        ) from exc
+    click.echo(f"Embedded kernel .config in {headers_deb.name} for VMware/DKMS.")
     ok, errs = pb.verify_packages(
         debs,
         expected_kernel_release=kernel_release,

@@ -268,7 +268,7 @@ Each build writes `data/packages/latest/build-info.json` with `requested_version
 
 `latest/` is replaced as one transactional build set only after all packages and metadata are complete. `checksums.sha256` is verified before install—including missing files—and archives use hard links when the filesystem supports them to avoid storing the same large `.deb` payload twice.
 
-After install, GetKernel verifies `/boot/vmlinuz-*`, `/lib/modules/<release>/`, and `/lib/modules/<release>/build` (headers symlink) when a kernel release hint is available.
+Before publishing a build, GetKernel embeds the exact build `.config` in the matching `linux-headers-<release>` package. This covers recent upstream header packaging that keeps `auto.conf` but omits `.config`, which VMware's proprietary header validator still requires. After install, GetKernel verifies `/boot/vmlinuz-*`, `/lib/modules/<release>/`, the headers symlink, `.config`, generated Kbuild headers, `Module.symvers`, and `modpost` when a kernel release hint is available.
 
 ## Privileges
 
@@ -380,7 +380,7 @@ GETKERNEL_NO_ELEVATE=1 getkernel check    # testing only
 - No cross-compilation support; native toolchain only.
 - kernel.org metadata is cached for 15 minutes and stale cache data is used if the network is temporarily unavailable. Source checksum verification still fails closed when enabled.
 - Some generated mainline/RC git snapshots in the [kernel.org releases API](https://www.kernel.org/releases.json) do not publish a SHA256 entry or detached tarball signature. With verification enabled GetKernel rejects them before downloading; choose a signed stable/LTS release, or explicitly disable only the unavailable check after accepting the reduced assurance.
-- GetKernel keeps module support/exported symbols enabled, requires a matching `linux-headers` package, and verifies `/lib/modules/<release>/build`. This avoids tool-created VMware/DKMS build failures; vendor sources can still be incompatible with a new **RC/mainline** kernel API.
+- GetKernel keeps module support/exported symbols enabled, requires a matching `linux-headers` package, embeds the build `.config` required by VMware, and verifies the complete external-module build environment under `/lib/modules/<release>/build`. This avoids tool-created VMware/DKMS build failures; vendor sources can still be incompatible with a new **RC/mainline** kernel API.
 - Generated **`linux-libc-dev`** and debug packages are archived but are not installed automatically, avoiding an unrelated replacement of distribution user-space headers.
 - **Secure Boot** may require extra steps for unsigned modules.
 - **Back up** and know how to boot a previous kernel before installing. `getkernel rollback` restores GetKernel's `/boot` file snapshot; it is not a full package/filesystem rollback.
