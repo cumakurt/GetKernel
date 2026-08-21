@@ -128,6 +128,56 @@ class TestInstaller(unittest.TestCase):
             (build_dir / ".config").write_text("CONFIG_MODULES=y\n", encoding="utf-8")
             self.assertEqual(Installer.external_module_header_issues(build_dir), [])
 
+    def test_ensure_external_module_config_restores_missing_config(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            boot = root / "boot"
+            build_dir = root / "modules" / "6.1.0" / "build"
+            boot.mkdir()
+            build_dir.mkdir(parents=True)
+            boot_config = boot / "config-6.1.0"
+            boot_config.write_text("CONFIG_MODULES=y\n", encoding="utf-8")
+
+            inst = Installer()
+            inst.boot_dir = boot
+            inst.modules_dir = root / "modules"
+
+            ok, message = inst.ensure_external_module_config("6.1.0")
+
+            build_config = build_dir / ".config"
+            self.assertTrue(ok, message)
+            self.assertIn("restored missing", message)
+            self.assertEqual(build_config.read_bytes(), boot_config.read_bytes())
+            self.assertEqual(build_config.stat().st_mode & 0o777, 0o644)
+
+    def test_install_packages_runs_external_module_config_check(self) -> None:
+        calls = []
+
+        def command(args: list, **_kwargs: object) -> subprocess.CompletedProcess:
+            calls.append(args[0])
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with patch("modules.installer.is_root", return_value=True):
+            with patch("modules.installer.sudo_prefix", return_value=[]):
+                inst = Installer()
+                with patch("modules.installer.check_file_safety", return_value=(True, "")):
+                    with patch.object(Installer, "_verify_package_states", return_value=[]):
+                        with patch.object(
+                            inst,
+                            "ensure_external_module_config",
+                            return_value=(True, "restored missing .config"),
+                        ) as ensure_config:
+                            with patch("modules.installer.run_cmd", side_effect=command):
+                                ok, log = inst.install_packages(
+                                    [Path("linux-image-6.1.0.deb")],
+                                    kernel_version_hint="6.1.0",
+                                )
+
+        self.assertTrue(ok)
+        ensure_config.assert_called_once_with("6.1.0")
+        self.assertEqual(calls, ["dpkg", "update-initramfs", "update-grub"])
+        self.assertIn("External-module header check", log)
+
 
 if __name__ == "__main__":
     unittest.main()

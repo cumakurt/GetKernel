@@ -28,9 +28,13 @@ class Installer:
     """dpkg + apt-get install -f + initramfs + grub."""
 
     BACKUP_DIR = Path("/var/backups/getkernel")
+    BOOT_DIR = Path("/boot")
+    MODULES_DIR = Path("/lib/modules")
 
     def __init__(self) -> None:
         self.backup_dir = self.BACKUP_DIR
+        self.boot_dir = self.BOOT_DIR
+        self.modules_dir = self.MODULES_DIR
         if is_root():
             self.backup_dir.mkdir(parents=True, exist_ok=True)
 
@@ -147,6 +151,13 @@ class Installer:
                 log += "\nPackage state verification failed:\n" + "\n".join(state_issues)
 
         if ok and kernel_version_hint:
+            config_ok, config_log = self.ensure_external_module_config(kernel_version_hint)
+            if config_log:
+                log += "\nExternal-module header check:\n" + config_log
+            if not config_ok:
+                ok = False
+
+        if ok and kernel_version_hint:
             initramfs = run_cmd(
                 pre + ["update-initramfs", "-u", "-k", kernel_version_hint],
                 timeout=1800,
@@ -184,7 +195,7 @@ class Installer:
             f"System.map-{kv}",
             f"config-{kv}",
         ):
-            src = Path("/boot") / name
+            src = self.boot_dir / name
             if src.is_file():
                 shutil.copy2(src, dest / name)
                 meta["files"].append(name)
@@ -220,7 +231,7 @@ class Installer:
             return False
         if not isinstance(meta, dict) or not isinstance(meta.get("files"), list):
             return False
-        boot = Path("/boot").resolve()
+        boot = self.boot_dir.resolve()
         pre = sudo_prefix()
         restore_pairs: List[Tuple[Path, Path]] = []
         seen_files = set()
@@ -323,9 +334,10 @@ class Installer:
         issues: List[str] = []
         if not validate_kernel_release(kernel_version):
             return False, [f"invalid kernel release: {kernel_version!r}"]
-        if not (Path("/boot") / f"vmlinuz-{kernel_version}").is_file():
-            issues.append(f"missing /boot/vmlinuz-{kernel_version}")
-        moddir = Path("/lib/modules") / kernel_version
+        boot_vmlinuz = self.boot_dir / f"vmlinuz-{kernel_version}"
+        if not boot_vmlinuz.is_file():
+            issues.append(f"missing {boot_vmlinuz}")
+        moddir = self.modules_dir / kernel_version
         if not moddir.is_dir():
             issues.append(f"missing {moddir}")
         else:
@@ -354,12 +366,58 @@ class Installer:
             if not (build_dir / relative).is_file()
         ]
 
+    def ensure_external_module_config(self, kernel_version: str) -> Tuple[bool, str]:
+        """Restore build/.config from /boot/config-* when upstream headers omit it."""
+        if not validate_kernel_release(kernel_version):
+            return False, f"invalid kernel release: {kernel_version!r}"
+
+        boot_config = self.boot_dir / f"config-{kernel_version}"
+        build_dir = self.modules_dir / kernel_version / "build"
+        build_config = build_dir / ".config"
+
+        if build_config.is_file() and not build_config.is_symlink():
+            return True, ""
+        if build_config.is_symlink() or (
+            build_config.exists() and not build_config.is_file()
+        ):
+            return False, f"unsafe existing header config path: {build_config}"
+        if not boot_config.is_file():
+            return False, f"missing {boot_config}; cannot restore {build_config}"
+        if not build_dir.is_dir():
+            return False, f"missing {build_dir}; install matching linux-headers"
+        try:
+            if boot_config.stat().st_size <= 0:
+                return False, f"empty {boot_config}; cannot restore {build_config}"
+        except OSError as exc:
+            return False, f"cannot read {boot_config}: {exc}"
+
+        try:
+            shutil.copy2(boot_config, build_config)
+            os.chmod(build_config, 0o644)
+        except PermissionError:
+            pre = sudo_prefix()
+            if not pre:
+                return False, f"permission denied writing {build_config}"
+            cp = run_cmd(
+                pre + ["install", "-m", "0644", str(boot_config), str(build_config)],
+                timeout=60,
+            )
+            if cp.returncode != 0:
+                detail = (cp.stderr or cp.stdout or "unknown error").strip()
+                return False, f"cannot restore {build_config}: {detail}"
+        except OSError as exc:
+            return False, f"cannot restore {build_config}: {exc}"
+
+        if not build_config.is_file() or build_config.is_symlink():
+            return False, f"failed to create a regular {build_config}"
+        return True, f"restored missing {build_config} from {boot_config}"
+
     def set_default_kernel(self, kernel_version: str) -> bool:
         return GrubManager().set_default_entry(kernel_version=kernel_version)
 
     def list_installed_kernels(self) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
-        boot = Path("/boot")
+        boot = self.boot_dir
         if not boot.is_dir():
             return out
         current = os.uname().release
